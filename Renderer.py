@@ -130,10 +130,13 @@ class FasterGSRenderer(BaseRenderer):
                     scales=gaussians.raw_scales[mask],
                     rotations=gaussians.raw_rotations[mask],
                     opacities=raw_opacities_lod[mask],
+                    distance_decay=gaussians.raw_distance_decay[mask],
                     sh_coefficients_0=gaussians.sh_coefficients_0[mask],
                     sh_coefficients_rest=gaussians.sh_coefficients_rest[mask],
                     densification_info=torch.empty(0, device=device),
                     rasterizer_settings=extract_settings(view, gaussians.active_sh_bases, bg_color, self.PROPER_ANTIALIASING),
+                    virtual_scale=virtual_scale,
+                    tau=tau,
                 )
             else:
                 image = torch.zeros(
@@ -151,10 +154,13 @@ class FasterGSRenderer(BaseRenderer):
                 scales=gaussians.raw_scales,
                 rotations=gaussians.raw_rotations,
                 opacities=gaussians.raw_opacities,
+                distance_decay=gaussians.raw_distance_decay,
                 sh_coefficients_0=gaussians.sh_coefficients_0,
                 sh_coefficients_rest=gaussians.sh_coefficients_rest,
                 densification_info=gaussians.densification_info if update_densification_info else torch.empty(0, device=device),
                 rasterizer_settings=extract_settings(view, gaussians.active_sh_bases, bg_color, self.PROPER_ANTIALIASING),
+                virtual_scale=virtual_scale,
+                tau=tau,
             )
 
         return image, {
@@ -188,10 +194,13 @@ class FasterGSRenderer(BaseRenderer):
                     scales=gaussians.raw_scales[mask] + math.log(max(self.SCALE_MODIFIER, 1e-6)),
                     rotations=gaussians.raw_rotations[mask],
                     opacities=raw_opacities_lod[mask],
+                    distance_decay=gaussians.raw_distance_decay[mask],
                     sh_coefficients_0=gaussians.sh_coefficients_0[mask],
                     sh_coefficients_rest=gaussians.sh_coefficients_rest[mask],
                     densification_info=torch.empty(0, device=device),
                     rasterizer_settings=extract_settings(view, gaussians.active_sh_bases, view.camera.background_color, self.PROPER_ANTIALIASING),
+                    virtual_scale=virtual_scale,
+                    tau=tau,
                 )
             else:
                 image = torch.zeros(
@@ -208,10 +217,13 @@ class FasterGSRenderer(BaseRenderer):
                 scales=gaussians.raw_scales + math.log(max(self.SCALE_MODIFIER, 1e-6)),
                 rotations=gaussians.raw_rotations,
                 opacities=gaussians.raw_opacities,
+                distance_decay=gaussians.raw_distance_decay,
                 sh_coefficients_0=gaussians.sh_coefficients_0,
                 sh_coefficients_rest=gaussians.sh_coefficients_rest,
                 densification_info=torch.empty(0, device=device),
                 rasterizer_settings=extract_settings(view, gaussians.active_sh_bases, view.camera.background_color, self.PROPER_ANTIALIASING),
+                virtual_scale=virtual_scale,
+                tau=tau,
             )
 
         image = image.clamp(0.0, 1.0)

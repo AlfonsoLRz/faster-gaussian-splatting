@@ -11,6 +11,7 @@ namespace faster_gs::rasterization {
         const torch::Tensor& scales,
         const torch::Tensor& rotations,
         const torch::Tensor& opacities,
+        const torch::Tensor& distance_decay,
         const torch::Tensor& sh_coefficients_0,
         const torch::Tensor& sh_coefficients_rest,
         const torch::Tensor& w2c,
@@ -25,7 +26,9 @@ namespace faster_gs::rasterization {
         const float center_y,
         const float near_plane,
         const float far_plane,
-        const bool proper_antialiasing);
+        const bool proper_antialiasing,
+        const float virtual_scale,
+        const float tau);
 
     std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
     backward_wrapper(
@@ -64,6 +67,7 @@ namespace faster_gs::rasterization {
         const torch::Tensor& scales,
         const torch::Tensor& rotations,
         const torch::Tensor& opacities,
+        const torch::Tensor& distance_decay,
         const torch::Tensor& sh_coefficients_0,
         const torch::Tensor& sh_coefficients_rest,
         const torch::Tensor& w2c,
@@ -79,7 +83,9 @@ namespace faster_gs::rasterization {
         const float near_plane,
         const float far_plane,
         const bool proper_antialiasing,
-        const bool to_chw);
+        const bool to_chw,
+        const float virtual_scale,
+        const float tau);
 
     void
     pruning_scores_wrapper(

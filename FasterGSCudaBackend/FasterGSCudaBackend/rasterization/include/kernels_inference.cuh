@@ -16,6 +16,7 @@ namespace faster_gs::rasterization::kernels::inference {
         const float3* __restrict__ scales,
         const float4* __restrict__ rotations,
         const float* __restrict__ opacities,
+        const float* __restrict__ distance_decay,
         const float3* __restrict__ sh_coefficients_0,
         const float3* __restrict__ sh_coefficients_rest,
         const float4* __restrict__ w2c,
@@ -42,7 +43,9 @@ namespace faster_gs::rasterization::kernels::inference {
         const float center_y,
         const float near_plane,
         const float far_plane,
-        const bool proper_antialiasing)
+        const bool proper_antialiasing,
+        const float virtual_scale,
+        const float tau)
     {
         constexpr uint warp_size = 32;
         auto block = cg::this_thread_block();

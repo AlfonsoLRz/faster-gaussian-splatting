@@ -14,6 +14,7 @@ namespace faster_gs::rasterization {
         const float3* scales,
         const float4* rotations,
         const float* opacities,
+        const float* distance_decay,
         const float3* sh_coefficients_0,
         const float3* sh_coefficients_rest,
         const float4* w2c,
@@ -32,6 +33,8 @@ namespace faster_gs::rasterization {
         const float near_plane,
         const float far_plane,
         const bool proper_antialiasing,
+        const float virtual_scale,
+        const float tau,
         const bool to_chw);
 
     template <typename KeyT>

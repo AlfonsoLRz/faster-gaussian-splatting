@@ -16,6 +16,7 @@ void faster_gs::rasterization::inference(
     const float3* scales,
     const float4* rotations,
     const float* opacities,
+    const float* distance_decay,
     const float3* sh_coefficients_0,
     const float3* sh_coefficients_rest,
     const float4* w2c,
@@ -34,6 +35,8 @@ void faster_gs::rasterization::inference(
     const float near_plane,
     const float far_plane,
     const bool proper_antialiasing,
+    const float virtual_scale,
+    const float tau,
     const bool to_chw)
 {
     const dim3 grid(div_round_up(width, config::tile_width), div_round_up(height, config::tile_height), 1);
@@ -66,6 +69,7 @@ void faster_gs::rasterization::inference(
         scales,
         rotations,
         opacities,
+        distance_decay,
         sh_coefficients_0,
         sh_coefficients_rest,
         w2c,
@@ -92,7 +96,9 @@ void faster_gs::rasterization::inference(
         center_y,
         near_plane,
         far_plane,
-        proper_antialiasing
+        proper_antialiasing,
+        virtual_scale,
+        tau
     );
     CHECK_CUDA(config::debug, "preprocess")
 
