@@ -15,13 +15,14 @@ from Optim.Samplers.DatasetSamplers import DatasetSampler
 
 @Framework.Configurable.configure(
     NUM_ITERATIONS=30_000,
-    DENSIFICATION_START_ITERATION=600,  # while official code states 500, densification actually starts at 600 there
-    DENSIFICATION_END_ITERATION=14_900,  # should be set to 24900 when using MCMC; while official code states 15000, densification actually stops at 14900 there
+    DENSIFICATION_START_ITERATION=600,
+    #DENSIFICATION_END_ITERATION=14_900,
+    DENSIFICATION_END_ITERATION=2_000,
     DENSIFICATION_INTERVAL=100,
-    DENSIFICATION_GRAD_THRESHOLD=0.0002,  # only used when USE_MCMC=False
-    DENSIFICATION_PERCENT_DENSE=0.01,  # only used when USE_MCMC=False
+    DENSIFICATION_GRAD_THRESHOLD=0.0002,
+    DENSIFICATION_PERCENT_DENSE=0.01,
     SPEEDYSPLAT_PRUNING=Framework.ConfigParameterList(
-        USE=False,  # only used when USE_MCMC=False
+        USE=False,
         START_ITERATION=6_000,
         END_ITERATION=30_000,
         INTERVAL=3_000,
@@ -29,40 +30,50 @@ from Optim.Samplers.DatasetSamplers import DatasetSampler
         HARD_PRUNING_RATIO=0.3,
     ),
     USE_MCMC=False,
-    MAX_PRIMITIVES=1_000_000,  # only used when USE_MCMC=True
-    OPACITY_RESET_INTERVAL=3_000,  # will be skipped when USE_MCMC=True
-    EXTRA_OPACITY_RESET_ITERATION=500,  # will be skipped when USE_MCMC=True
-    MORTON_ORDERING_INTERVAL=5000,  # lowering to 2500 or 1000 may improve performance when number of Gaussians is high
-    MORTON_ORDERING_END_ITERATION=15000,  # should be set to 25000 when using MCMC
+    MAX_PRIMITIVES=1_000_000,
+    OPACITY_RESET_INTERVAL=3_000,
+    EXTRA_OPACITY_RESET_ITERATION=500,
+    MORTON_ORDERING_INTERVAL=5000,
+    MORTON_ORDERING_END_ITERATION=15000,
     FILTER_3D=Framework.ConfigParameterList(
         USE=False,
-        ORIGINAL_FORMULATION=False,  # if True, the original formulation from the Mip-Splatting paper is used
+        ORIGINAL_FORMULATION=False,
         FILTER_VARIANCE=0.2,
     ),
-    USE_RANDOM_BACKGROUND_COLOR=False,  # prevents the model from overfitting to the background color
+    USE_RANDOM_BACKGROUND_COLOR=False,
     MIN_OPACITY_AFTER_TRAINING=1 / 255,
     RANDOM_INITIALIZATION=Framework.ConfigParameterList(
-        FORCE=False,  # if True, the point cloud from the dataset will be ignored
-        N_POINTS=100_000,  # number of random points to be sampled within the scene bounding box
-        ENABLE_CARVING=True,  # removes points that are never in-frustum in any training view
-        CARVING_IN_ALL_FRUSTUMS=False,  # removes points not in-frustum in all views
-        CARVING_ENFORCE_ALPHA=False,  # removes points that project to a pixel with alpha=0 in any view where the point is in-frustum
+        FORCE=False,
+        N_POINTS=100_000,
+        ENABLE_CARVING=True,
+        CARVING_IN_ALL_FRUSTUMS=False,
+        CARVING_ENFORCE_ALPHA=False,
+    ),
+    CLOD=Framework.ConfigParameterList(
+        USE=True,
+        START_ITERATION=2100,
+        VIRTUAL_SCALE_MIN=2.0,
+        VIRTUAL_SCALE_MAX=7.0,
+        TAU=1e-2,
+        LAMBDA_REG=5.0,
+        ETA_EXPONENT=1.5,
     ),
     LOSS=Framework.ConfigParameterList(
-        LAMBDA_L1=0.8,  # weight for the per-pixel L1 loss on the rgb image
-        LAMBDA_DSSIM=0.2,  # weight for the DSSIM loss on the rgb image
-        LAMBDA_OPACITY_REGULARIZATION=0.0,  # should be set to 0.01 when using MCMC
-        LAMBDA_SCALE_REGULARIZATION=0.0,  # should be set to 0.01 when using MCMC
+        LAMBDA_L1=0.8,
+        LAMBDA_DSSIM=0.2,
+        LAMBDA_OPACITY_REGULARIZATION=0.0,
+        LAMBDA_SCALE_REGULARIZATION=0.0,
     ),
     OPTIMIZER=Framework.ConfigParameterList(
         LEARNING_RATE_MEANS_INIT=0.00016,
         LEARNING_RATE_MEANS_FINAL=0.0000016,
         LEARNING_RATE_MEANS_MAX_STEPS=30_000,
         LEARNING_RATE_SH_COEFFICIENTS_0=0.0025,
-        LEARNING_RATE_SH_COEFFICIENTS_REST=0.000125,  # 0.0025 / 20
-        LEARNING_RATE_OPACITIES=0.025,  # use 0.05 (old default in official code) with MCMC densification or Speedy-Splat pruning to match the respective paper
+        LEARNING_RATE_SH_COEFFICIENTS_REST=0.000125,
+        LEARNING_RATE_OPACITIES=0.025,
         LEARNING_RATE_SCALES=0.005,
         LEARNING_RATE_ROTATIONS=0.001,
+        LEARNING_RATE_DISTANCE_DECAY=0.01,
     ),
 )
 class FasterGSTrainer(GuiTrainer):
@@ -77,6 +88,35 @@ class FasterGSTrainer(GuiTrainer):
         super().__init__(**kwargs)
         self.train_sampler = None
         self.loss = FasterGSLoss(loss_config=self.LOSS, gaussians=self.model.gaussians)
+
+    def sample_virtual_scale(self, iteration: int) -> float:
+        """Samples the virtual distance scale used by CLoD."""
+        if not self.CLOD.USE:
+            return 1.0
+        if iteration < self.CLOD.START_ITERATION:
+            return 1.0
+        return float(torch.empty(1, device=Framework.config.GLOBAL.DEFAULT_DEVICE).uniform_(
+            self.CLOD.VIRTUAL_SCALE_MIN,
+            self.CLOD.VIRTUAL_SCALE_MAX
+        ).item())
+
+    def use_clod_this_iteration(self, iteration: int) -> bool:
+        """For the first prototype, only enable CLoD after densification ends."""
+        return (
+            self.CLOD.USE
+            and iteration >= self.CLOD.START_ITERATION
+            and iteration >= self.DENSIFICATION_END_ITERATION
+        )
+
+    def clod_regularization_loss(self, eta_actual: torch.Tensor, virtual_scale: float) -> torch.Tensor:
+        """Computes the CLoD regularizer."""
+        eta_target = 1.0 / (virtual_scale ** self.CLOD.ETA_EXPONENT)
+        return ((virtual_scale - 1.0) ** 2) * torch.relu(eta_actual - eta_target).square()
+
+    def clod_weight(self, virtual_scale: float) -> float:
+        """Scale-dependent weight used in the CLoD training loss."""
+        smax = max(self.CLOD.VIRTUAL_SCALE_MAX, 1.0)
+        return (1.0 - 0.5 * virtual_scale / smax) ** 2
 
     @pre_training_callback(priority=50)
     @torch.no_grad()
@@ -96,13 +136,24 @@ class FasterGSTrainer(GuiTrainer):
         if dataset.point_cloud is not None and not self.RANDOM_INITIALIZATION.FORCE:
             point_cloud = dataset.point_cloud
         else:
-            samples = torch.rand((self.RANDOM_INITIALIZATION.N_POINTS, 3), dtype=torch.float32, device=Framework.config.GLOBAL.DEFAULT_DEVICE)
+            samples = torch.rand(
+                (self.RANDOM_INITIALIZATION.N_POINTS, 3),
+                dtype=torch.float32,
+                device=Framework.config.GLOBAL.DEFAULT_DEVICE
+            )
             positions = samples * dataset.bounding_box.size + dataset.bounding_box.min
             if self.RANDOM_INITIALIZATION.ENABLE_CARVING:
-                positions = carve(positions, dataset, self.RANDOM_INITIALIZATION.CARVING_IN_ALL_FRUSTUMS, self.RANDOM_INITIALIZATION.CARVING_ENFORCE_ALPHA)
+                positions = carve(
+                    positions,
+                    dataset,
+                    self.RANDOM_INITIALIZATION.CARVING_IN_ALL_FRUSTUMS,
+                    self.RANDOM_INITIALIZATION.CARVING_ENFORCE_ALPHA
+                )
             point_cloud = BasicPointCloud(positions)
+
         self.model.gaussians.initialize_from_point_cloud(point_cloud, self.USE_MCMC)
         self.model.gaussians.training_setup(self, radius)
+
         if not self.USE_MCMC:
             self.model.gaussians.reset_densification_info()
         if self.FILTER_3D.USE:
@@ -121,17 +172,29 @@ class FasterGSTrainer(GuiTrainer):
         if self.USE_MCMC:
             self.model.gaussians.mcmc_densification(min_opacity=0.005, cap_max=self.MAX_PRIMITIVES)
         else:
-            self.model.gaussians.adaptive_density_control(self.DENSIFICATION_GRAD_THRESHOLD, 0.005, iteration > self.OPACITY_RESET_INTERVAL)
+            self.model.gaussians.adaptive_density_control(
+                self.DENSIFICATION_GRAD_THRESHOLD,
+                0.005,
+                iteration > self.OPACITY_RESET_INTERVAL
+            )
 
-            if self.SPEEDYSPLAT_PRUNING.USE and self.SPEEDYSPLAT_PRUNING.START_ITERATION <= iteration < self.SPEEDYSPLAT_PRUNING.END_ITERATION and iteration % self.SPEEDYSPLAT_PRUNING.INTERVAL == 0:
-                # Soft Pruning (see https://github.com/j-alex-hanson/speedy-splat/blob/e480b2c3944e4aac4e251307216fe1b8d6a0afc3/train.py#L178-L188)
+            if (
+                self.SPEEDYSPLAT_PRUNING.USE
+                and self.SPEEDYSPLAT_PRUNING.START_ITERATION <= iteration < self.SPEEDYSPLAT_PRUNING.END_ITERATION
+                and iteration % self.SPEEDYSPLAT_PRUNING.INTERVAL == 0
+            ):
                 scores = self.renderer.compute_pruning_scores(dataset.train())
-                self.model.gaussians.importance_pruning(scores, pruning_ratio=self.SPEEDYSPLAT_PRUNING.SOFT_PRUNING_RATIO)
+                self.model.gaussians.importance_pruning(
+                    scores,
+                    pruning_ratio=self.SPEEDYSPLAT_PRUNING.SOFT_PRUNING_RATIO
+                )
 
             if iteration < self.DENSIFICATION_END_ITERATION:
                 self.model.gaussians.reset_densification_info()
+
         if self.requires_empty_cache:
             torch.cuda.empty_cache()
+
         if self.FILTER_3D.USE:
             self.model.gaussians.compute_3d_filter(dataset.train())
 
@@ -159,38 +222,72 @@ class FasterGSTrainer(GuiTrainer):
     @torch.no_grad()
     def reset_opacities_extra(self, _, dataset: 'BaseDataset') -> None:
         """Reset opacities one additional time when using a white background."""
-        # original implementation only supports black or white background, this is an attempt to make it work with any color
         if not self.USE_MCMC and dataset.default_camera.background_color.sum() != 0.0:
             Logger.log_info('resetting opacities one additional time because using non-black background')
             self.model.gaussians.reset_opacities()
 
     @training_callback(priority=80)
     def training_iteration(self, iteration: int, dataset: 'BaseDataset') -> None:
-        """Performs a training step without actually doing the optimizer step."""
-        # init modes
+        """Performs a training step."""
         self.model.train()
         dataset.train()
         self.loss.train()
-        # update learning rate
+
         self.model.gaussians.update_learning_rate(iteration + 1)
-        # get random view
+
         view = self.train_sampler.get(dataset=dataset)['view']
-        # render
+
         bg_color = torch.rand_like(view.camera.background_color) if self.USE_RANDOM_BACKGROUND_COLOR else view.camera.background_color
-        image = self.renderer.render_image_training(
+
+        use_clod = self.use_clod_this_iteration(iteration)
+        virtual_scale = self.sample_virtual_scale(iteration) if use_clod else 1.0
+
+        render_output = self.renderer.render_image_training(
             view=view,
             update_densification_info=not self.USE_MCMC and iteration < self.DENSIFICATION_END_ITERATION,
             bg_color=bg_color,
+            virtual_scale=virtual_scale,
+            tau=self.CLOD.TAU,
         )
-        # calculate loss
-        # compose gt with background color if needed  # FIXME: integrate into data model
+
+        if isinstance(render_output, tuple):
+            image, lod_meta = render_output
+        else:
+            image = render_output
+            lod_meta = {
+                'eta_actual': torch.ones((), dtype=image.dtype, device=image.device),
+                'virtual_scale': 1.0,
+            }
+
         rgb_gt = view.rgb
         if (alpha_gt := view.alpha) is not None:
             rgb_gt = apply_background_color(rgb_gt, alpha_gt, bg_color)
-        loss = self.loss(image, rgb_gt)
-        # backward
+
+        render_loss = self.loss(image, rgb_gt)
+
+        if use_clod:
+            eta_actual = lod_meta['eta_actual']
+            l_reg = self.clod_regularization_loss(eta_actual, virtual_scale)
+            w_s = self.clod_weight(virtual_scale)
+            loss = w_s * (render_loss + self.CLOD.LAMBDA_REG * l_reg)
+        else:
+            l_reg = torch.zeros((), dtype=render_loss.dtype, device=render_loss.device)
+            loss = render_loss
+
+        if use_clod and iteration % 100 == 0:
+            eta_target = 1.0 / (virtual_scale ** self.CLOD.ETA_EXPONENT)
+            Logger.log_info(
+                f'iter={iteration} '
+                f'vs={virtual_scale:.3f} '
+                f'eta={eta_actual.item():.4f} '
+                f'etat={eta_target:.4f} '
+                f'lreg={l_reg.item():.6f} '
+                f'raw_decay_mean={self.model.gaussians.raw_distance_decay.mean().item():.6f} '
+                f'decay_mean={torch.relu(self.model.gaussians.raw_distance_decay).mean().item():.6f}'
+            )
+
         loss.backward()
-        # optimizer step
+
         self.model.gaussians.optimizer.step()
         self.model.gaussians.optimizer.zero_grad()
         self.model.gaussians.post_optimizer_step(inject_noise=self.USE_MCMC)
@@ -198,19 +295,22 @@ class FasterGSTrainer(GuiTrainer):
     @training_callback(active='SPEEDYSPLAT_PRUNING.USE', priority=70, start_iteration='SPEEDYSPLAT_PRUNING.START_ITERATION', end_iteration='SPEEDYSPLAT_PRUNING.END_ITERATION', iteration_stride='SPEEDYSPLAT_PRUNING.INTERVAL')
     @torch.no_grad()
     def hard_pruning(self, iteration: int, dataset: 'BaseDataset') -> None:
-        """Speedy-Splat Hard Pruning (see https://github.com/j-alex-hanson/speedy-splat/blob/e480b2c3944e4aac4e251307216fe1b8d6a0afc3/train.py#L202-L213)."""
+        """Speedy-Splat Hard Pruning."""
         if iteration >= self.DENSIFICATION_END_ITERATION + self.DENSIFICATION_INTERVAL:
             scores = self.renderer.compute_pruning_scores(dataset.train())
-            self.model.gaussians.importance_pruning(scores, pruning_ratio=self.SPEEDYSPLAT_PRUNING.HARD_PRUNING_RATIO)
+            self.model.gaussians.importance_pruning(
+                scores,
+                pruning_ratio=self.SPEEDYSPLAT_PRUNING.HARD_PRUNING_RATIO
+            )
 
     @training_callback(active='WANDB.ACTIVATE', priority=10, iteration_stride='WANDB.INTERVAL')
     @torch.no_grad()
     def log_wandb(self, iteration: int, dataset: 'BaseDataset') -> None:
         """Adds Gaussian count to default Weights & Biases logging."""
-        Framework.wandb.log({
+        log_dict = {
             '#Gaussians': self.model.gaussians.means.shape[0]
-        }, step=iteration)
-        # default logging
+        }
+        Framework.wandb.log(log_dict, step=iteration)
         super().log_wandb(iteration, dataset)
 
     @post_training_callback(priority=1000)

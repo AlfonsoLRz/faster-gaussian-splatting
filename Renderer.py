@@ -42,10 +42,43 @@ def extract_settings(
     )
 
 
+def compute_clod_opacity_and_mask(
+    means: torch.Tensor,
+    raw_opacities: torch.Tensor,
+    raw_distance_decay: torch.Tensor,
+    camera_position: torch.Tensor,
+    virtual_scale: float,
+    tau: float,
+    eps: float = 1e-8,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Computes CLoD-adjusted opacities and a binary mask."""
+    if means.shape[0] == 0:
+        empty_mask = torch.zeros((0,), dtype=torch.bool, device=means.device)
+        empty_opacities = raw_opacities
+        eta_actual = torch.zeros((), dtype=raw_opacities.dtype, device=raw_opacities.device)
+        return empty_opacities, empty_mask, eta_actual
+
+    d = torch.linalg.norm(means - camera_position[None, :], dim=1, keepdim=True)
+    d_norm = d / d.max().clamp_min(eps)
+
+    sigma = torch.relu(raw_distance_decay)
+    alpha = raw_opacities.sigmoid()
+
+    alpha_lod = alpha * torch.exp(-((d_norm * virtual_scale) ** 2) / (2.0 * sigma.square() + eps))
+    mask = (alpha_lod > (tau * virtual_scale)).squeeze(-1)
+
+    raw_opacities_lod = alpha_lod.clamp(1e-6, 1.0 - 1e-6).logit()
+    eta_actual = mask.float().mean()
+
+    return raw_opacities_lod, mask, eta_actual
+
+
 @Framework.Configurable.configure(
     SCALE_MODIFIER=1.0,
     PROPER_ANTIALIASING=False,
     FORCE_OPTIMIZED_INFERENCE=False,
+    CLOD_VIRTUAL_SCALE=1.0,
+    CLOD_TAU=1e-3,
 )
 class FasterGSRenderer(BaseRenderer):
     """Wrapper around the rasterization module from 3DGS."""
@@ -66,33 +99,121 @@ class FasterGSRenderer(BaseRenderer):
         else:
             return self.render_image_inference(view, to_chw)
 
-    def render_image_training(self, view: View, update_densification_info: bool, bg_color: torch.Tensor) -> torch.Tensor:
+    def render_image_training(
+        self,
+        view: View,
+        update_densification_info: bool,
+        bg_color: torch.Tensor,
+        virtual_scale: float = 1.0,
+        tau: float = 1e-3,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor | float]]:
         """Renders an image for a given view."""
-        image = diff_rasterize(
-            means=self.model.gaussians.means,
-            scales=self.model.gaussians.raw_scales,
-            rotations=self.model.gaussians.raw_rotations,
-            opacities=self.model.gaussians.raw_opacities,
-            sh_coefficients_0=self.model.gaussians.sh_coefficients_0,
-            sh_coefficients_rest=self.model.gaussians.sh_coefficients_rest,
-            densification_info=self.model.gaussians.densification_info if update_densification_info else torch.empty(0),
-            rasterizer_settings=extract_settings(view, self.model.gaussians.active_sh_bases, bg_color, self.PROPER_ANTIALIASING),
-        )
-        return image
+        gaussians = self.model.gaussians
+        device = gaussians.means.device
+
+        # For the first safe prototype, do not use CLoD while densification info is being updated.
+        use_clod = (virtual_scale > 1.0) and (not update_densification_info)
+
+        if use_clod:
+            raw_opacities_lod, mask, eta_actual = compute_clod_opacity_and_mask(
+                means=gaussians.means,
+                raw_opacities=gaussians.raw_opacities,
+                raw_distance_decay=gaussians.raw_distance_decay,
+                camera_position=view.position,
+                virtual_scale=virtual_scale,
+                tau=tau,
+            )
+
+            if mask.any():
+                image = diff_rasterize(
+                    means=gaussians.means[mask],
+                    scales=gaussians.raw_scales[mask],
+                    rotations=gaussians.raw_rotations[mask],
+                    opacities=raw_opacities_lod[mask],
+                    sh_coefficients_0=gaussians.sh_coefficients_0[mask],
+                    sh_coefficients_rest=gaussians.sh_coefficients_rest[mask],
+                    densification_info=torch.empty(0, device=device),
+                    rasterizer_settings=extract_settings(view, gaussians.active_sh_bases, bg_color, self.PROPER_ANTIALIASING),
+                )
+            else:
+                image = torch.zeros(
+                    (3, view.camera.height, view.camera.width),
+                    dtype=bg_color.dtype,
+                    device=device,
+                )
+                image[0] = bg_color[0]
+                image[1] = bg_color[1]
+                image[2] = bg_color[2]
+        else:
+            eta_actual = torch.ones((), dtype=gaussians.means.dtype, device=device)
+            image = diff_rasterize(
+                means=gaussians.means,
+                scales=gaussians.raw_scales,
+                rotations=gaussians.raw_rotations,
+                opacities=gaussians.raw_opacities,
+                sh_coefficients_0=gaussians.sh_coefficients_0,
+                sh_coefficients_rest=gaussians.sh_coefficients_rest,
+                densification_info=gaussians.densification_info if update_densification_info else torch.empty(0, device=device),
+                rasterizer_settings=extract_settings(view, gaussians.active_sh_bases, bg_color, self.PROPER_ANTIALIASING),
+            )
+
+        return image, {
+            'eta_actual': eta_actual,
+            'virtual_scale': virtual_scale,
+        }
 
     @torch.no_grad()
     def render_image_inference(self, view: View, to_chw: bool = False) -> dict[str, torch.Tensor]:
         """Renders an image for a given view."""
-        image = diff_rasterize(
-            means=self.model.gaussians.means,
-            scales=self.model.gaussians.raw_scales + math.log(max(self.SCALE_MODIFIER, 1e-6)),
-            rotations=self.model.gaussians.raw_rotations,
-            opacities=self.model.gaussians.raw_opacities,
-            sh_coefficients_0=self.model.gaussians.sh_coefficients_0,
-            sh_coefficients_rest=self.model.gaussians.sh_coefficients_rest,
-            densification_info=torch.empty(0),
-            rasterizer_settings=extract_settings(view, self.model.gaussians.active_sh_bases, view.camera.background_color, self.PROPER_ANTIALIASING),
-        )
+        gaussians = self.model.gaussians
+        device = gaussians.means.device
+        virtual_scale = self.CLOD_VIRTUAL_SCALE
+        tau = self.CLOD_TAU
+
+        use_clod = virtual_scale > 1.0
+
+        if use_clod:
+            raw_opacities_lod, mask, _ = compute_clod_opacity_and_mask(
+                means=gaussians.means,
+                raw_opacities=gaussians.raw_opacities,
+                raw_distance_decay=gaussians.raw_distance_decay,
+                camera_position=view.position,
+                virtual_scale=virtual_scale,
+                tau=tau,
+            )
+
+            if mask.any():
+                image = diff_rasterize(
+                    means=gaussians.means[mask],
+                    scales=gaussians.raw_scales[mask] + math.log(max(self.SCALE_MODIFIER, 1e-6)),
+                    rotations=gaussians.raw_rotations[mask],
+                    opacities=raw_opacities_lod[mask],
+                    sh_coefficients_0=gaussians.sh_coefficients_0[mask],
+                    sh_coefficients_rest=gaussians.sh_coefficients_rest[mask],
+                    densification_info=torch.empty(0, device=device),
+                    rasterizer_settings=extract_settings(view, gaussians.active_sh_bases, view.camera.background_color, self.PROPER_ANTIALIASING),
+                )
+            else:
+                image = torch.zeros(
+                    (3, view.camera.height, view.camera.width),
+                    dtype=view.camera.background_color.dtype,
+                    device=device,
+                )
+                image[0] = view.camera.background_color[0]
+                image[1] = view.camera.background_color[1]
+                image[2] = view.camera.background_color[2]
+        else:
+            image = diff_rasterize(
+                means=gaussians.means,
+                scales=gaussians.raw_scales + math.log(max(self.SCALE_MODIFIER, 1e-6)),
+                rotations=gaussians.raw_rotations,
+                opacities=gaussians.raw_opacities,
+                sh_coefficients_0=gaussians.sh_coefficients_0,
+                sh_coefficients_rest=gaussians.sh_coefficients_rest,
+                densification_info=torch.empty(0, device=device),
+                rasterizer_settings=extract_settings(view, gaussians.active_sh_bases, view.camera.background_color, self.PROPER_ANTIALIASING),
+            )
+
         image = image.clamp(0.0, 1.0)
         return {'rgb': image if to_chw else image.permute(1, 2, 0)}
 

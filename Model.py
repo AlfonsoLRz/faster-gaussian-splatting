@@ -27,12 +27,15 @@ class Gaussians(torch.nn.Module):
         self.active_sh_degree = sh_degree if pretrained else 0
         self.active_sh_bases = (self.active_sh_degree + 1) ** 2
         self.max_sh_degree = sh_degree
+
         self.register_parameter('_means', None)
         self.register_parameter('_sh_coefficients_0', None)
         self.register_parameter('_sh_coefficients_rest', None)
         self.register_parameter('_scales', None)
         self.register_parameter('_rotations', None)
         self.register_parameter('_opacities', None)
+        self.register_parameter('_distance_decay', None)
+
         self._densification_info = None
         self.optimizer = None
         self.percent_dense = 0.0
@@ -104,6 +107,16 @@ class Gaussians(torch.nn.Module):
         return raw_opacities
 
     @property
+    def distance_decay(self) -> torch.Tensor:
+        """Returns the activated distance decay factors (N, 1)."""
+        return torch.nn.functional.softplus(self._distance_decay)
+
+    @property
+    def raw_distance_decay(self) -> torch.Tensor:
+        """Returns the unactivated distance decay factors (N, 1)."""
+        return self._distance_decay
+
+    @property
     def sh_coefficients(self) -> torch.Tensor:
         """Returns the Gaussians' SH coefficients for all bases (N, (max_degree + 1) ** 2, 3)."""
         return torch.cat([self._sh_coefficients_0, self._sh_coefficients_rest], dim=1)
@@ -160,7 +173,6 @@ class Gaussians(torch.nn.Module):
             if view.camera.distortion is not None:
                 Logger.log_warning('update3dfilter ignores all distortion parameters')
             max_focal = max(max_focal, max(view.camera.focal_x, view.camera.focal_y))
-        # assume max_focal is focal length of the highest resolution camera
         self.distance2filter = math.sqrt(filter_config.FILTER_VARIANCE) / max_focal
         self.compute_3d_filter(dataset)
 
@@ -192,39 +204,45 @@ class Gaussians(torch.nn.Module):
         filter_3d_max = filter_3d[visibility_mask].max()
         filter_3d = torch.where(visibility_mask, filter_3d, filter_3d_max, out=filter_3d)
         if self.use_original_3d_filter:
-            filter_3d = filter_3d.square()  # original implementation always needs this in squared form
+            filter_3d = filter_3d.square()
         elif self.use_optimized_3d_filter:
-            filter_3d = filter_3d.log()  # optimized implementation uses this to directly clamp scales in logspace
+            filter_3d = filter_3d.log()
         self._filter_3d = filter_3d
 
     def initialize_from_point_cloud(self, point_cloud: BasicPointCloud, use_mcmc: bool) -> None:
         """Initializes the model from a point cloud."""
-        # initial means
         means = point_cloud.positions.cuda()
         n_initial_gaussians = means.shape[0]
         Logger.log_info(f'number of Gaussians at initialization: {n_initial_gaussians:,}')
-        # initial sh coefficients
+
         rgbs = torch.full_like(means, fill_value=0.5) if point_cloud.colors is None else point_cloud.colors.cuda()
         sh_coefficients_0 = ((rgbs - 0.5) / 0.28209479177387814)[:, None, :]
-        sh_coefficients_rest = torch.zeros((n_initial_gaussians, (self.max_sh_degree + 1) ** 2 - 1, 3), dtype=torch.float32, device='cuda')
-        # initial scales
+        sh_coefficients_rest = torch.zeros(
+            (n_initial_gaussians, (self.max_sh_degree + 1) ** 2 - 1, 3),
+            dtype=torch.float32,
+            device='cuda'
+        )
+
         distances = compute_root_mean_squared_knn_distances(means)
         distances = distances * 0.1 if use_mcmc else distances
         scales = distances.log()[..., None].repeat(1, 3)
-        # initial rotations
+
         rotations = torch.zeros((n_initial_gaussians, 4), dtype=torch.float32, device='cuda')
         rotations[:, 0] = 1.0
-        # initial opacities
+
         initial_opacity = 0.5 if use_mcmc else 0.1
         initial_opacity_logit = math.log(initial_opacity / (1.0 - initial_opacity))
         opacities = torch.full((n_initial_gaussians, 1), fill_value=initial_opacity_logit, dtype=torch.float32, device='cuda')
-        # setup parameters
+
+        distance_decay = torch.full((n_initial_gaussians, 1), fill_value=0.1, dtype=torch.float32, device='cuda')
+
         self._means = torch.nn.Parameter(means.contiguous())
         self._sh_coefficients_0 = torch.nn.Parameter(sh_coefficients_0.contiguous())
         self._sh_coefficients_rest = torch.nn.Parameter(sh_coefficients_rest.contiguous())
         self._scales = torch.nn.Parameter(scales.contiguous())
         self._rotations = torch.nn.Parameter(rotations.contiguous())
         self._opacities = torch.nn.Parameter(opacities.contiguous())
+        self._distance_decay = torch.nn.Parameter(distance_decay.contiguous())
 
     def training_setup(self, training_wrapper, training_cameras_extent: float) -> None:
         """Sets up the optimizer."""
@@ -237,7 +255,8 @@ class Gaussians(torch.nn.Module):
             {'params': [self._sh_coefficients_rest], 'lr': training_wrapper.OPTIMIZER.LEARNING_RATE_SH_COEFFICIENTS_REST, 'name': 'sh_coefficients_rest'},
             {'params': [self._opacities], 'lr': training_wrapper.OPTIMIZER.LEARNING_RATE_OPACITIES, 'name': 'opacities'},
             {'params': [self._scales], 'lr': training_wrapper.OPTIMIZER.LEARNING_RATE_SCALES, 'name': 'scales'},
-            {'params': [self._rotations], 'lr': training_wrapper.OPTIMIZER.LEARNING_RATE_ROTATIONS, 'name': 'rotations'}
+            {'params': [self._rotations], 'lr': training_wrapper.OPTIMIZER.LEARNING_RATE_ROTATIONS, 'name': 'rotations'},
+            {'params': [self._distance_decay], 'lr': training_wrapper.OPTIMIZER.LEARNING_RATE_DISTANCE_DECAY, 'name': 'distance_decay'},
         ]
 
         self.optimizer = FusedAdam(param_groups, lr=0.0, eps=1e-15)
@@ -257,9 +276,8 @@ class Gaussians(torch.nn.Module):
 
     def reset_opacities(self) -> None:
         """Resets the opacities to a fixed value."""
-        opacities_new = self._opacities.clamp_max(-4.595119953155518)  # sigmoid(-4.595119953155518) = 0.01
+        opacities_new = self._opacities.clamp_max(-4.595119953155518)
         if self.use_original_3d_filter:
-            # make sure that the current 3d filter has the same effect on the new opacities
             scales_square = self._scales.exp().square()
             det1 = scales_square.prod(dim=1)
             scales_after_square = scales_square + self._filter_3d
@@ -279,6 +297,7 @@ class Gaussians(torch.nn.Module):
         self._opacities = param_groups['opacities']
         self._scales = param_groups['scales']
         self._rotations = param_groups['rotations']
+        self._distance_decay = param_groups['distance_decay']
 
         if self._densification_info is not None:
             self._densification_info = self._densification_info[:, valid_mask].contiguous()
@@ -295,13 +314,14 @@ class Gaussians(torch.nn.Module):
         self._opacities = param_groups['opacities']
         self._scales = param_groups['scales']
         self._rotations = param_groups['rotations']
+        self._distance_decay = param_groups['distance_decay']
 
         if self._densification_info is not None:
             self._densification_info = self._densification_info[:, ordering].contiguous()
         if self._filter_3d is not None:
             self._filter_3d = self._filter_3d[ordering].contiguous()
 
-    def reset_densification_info(self):
+    def reset_densification_info(self) -> None:
         self._densification_info = torch.zeros((2, self._means.shape[0]), dtype=torch.float32, device='cuda')
 
     def adaptive_density_control(self, grad_threshold: float, min_opacity: float, prune_large_gaussians: bool) -> None:
@@ -309,7 +329,6 @@ class Gaussians(torch.nn.Module):
         densification_mask = self.densification_info[1] >= grad_threshold * self.densification_info[0].clamp_min(1.0)
         is_small = torch.max(self._scales, dim=1).values <= math.log(self.percent_dense * self.training_cameras_extent)
 
-        # duplicate small gaussians
         duplicate_mask = densification_mask & is_small
         n_new_gaussians_duplicate = duplicate_mask.sum().item()
         duplicated_means = self._means[duplicate_mask]
@@ -318,20 +337,20 @@ class Gaussians(torch.nn.Module):
         duplicated_opacities = self._opacities[duplicate_mask]
         duplicated_scales = self._scales[duplicate_mask]
         duplicated_rotations = self._rotations[duplicate_mask]
+        duplicated_distance_decay = self._distance_decay[duplicate_mask]
 
-        # split large gaussians
         split_mask = densification_mask & ~is_small
         n_new_gaussians_split = 2 * split_mask.sum().item()
         split_scales = self._scales[split_mask].exp().expand(2, -1, -1).flatten(end_dim=1)
         split_rotations = self._rotations[split_mask].expand(2, -1, -1).flatten(end_dim=1)
         offsets = (quaternion_to_rotation_matrix(split_rotations) @ (split_scales * torch.randn_like(split_scales))[..., None])[..., 0]
         split_means = self._means[split_mask].expand(2, -1, -1).flatten(end_dim=1) + offsets
-        split_scales = split_scales.mul(0.625).log()  # 1 / 1.6 = 0.625
+        split_scales = split_scales.mul(0.625).log()
         split_sh_coefficients_0 = self._sh_coefficients_0[split_mask].expand(2, -1, -1, -1).flatten(end_dim=1)
         split_sh_coefficients_rest = self._sh_coefficients_rest[split_mask].expand(2, -1, -1, -1).flatten(end_dim=1)
         split_opacities = self._opacities[split_mask].expand(2, -1, -1).flatten(end_dim=1)
+        split_distance_decay = self._distance_decay[split_mask].expand(2, -1, -1).flatten(end_dim=1)
 
-        # incorporate
         n_new_gaussians = n_new_gaussians_duplicate + n_new_gaussians_split
         param_groups = extend_param_groups(self.optimizer, {
             'means': torch.cat([duplicated_means, split_means]),
@@ -339,7 +358,8 @@ class Gaussians(torch.nn.Module):
             'sh_coefficients_rest': torch.cat([duplicated_sh_coefficients_rest, split_sh_coefficients_rest]),
             'opacities': torch.cat([duplicated_opacities, split_opacities]),
             'scales': torch.cat([duplicated_scales, split_scales]),
-            'rotations': torch.cat([duplicated_rotations, split_rotations])
+            'rotations': torch.cat([duplicated_rotations, split_rotations]),
+            'distance_decay': torch.cat([duplicated_distance_decay, split_distance_decay]),
         })
         self._means = param_groups['means']
         self._sh_coefficients_0 = param_groups['sh_coefficients_0']
@@ -347,12 +367,11 @@ class Gaussians(torch.nn.Module):
         self._opacities = param_groups['opacities']
         self._scales = param_groups['scales']
         self._rotations = param_groups['rotations']
+        self._distance_decay = param_groups['distance_decay']
 
-        # if they were set, densification info and 3d filter are now no longer valid
         self._densification_info = None
         self._filter_3d = None
 
-        # prune
         prune_mask = torch.cat([split_mask, torch.zeros(n_new_gaussians, dtype=torch.bool, device='cuda')])
         prune_mask |= self._opacities.flatten() < math.log(min_opacity / (1 - min_opacity))
         prune_mask |= self._rotations.mul(self._rotations).sum(dim=1) < 1e-8
@@ -360,23 +379,22 @@ class Gaussians(torch.nn.Module):
             prune_mask |= self._scales.max(dim=1).values > math.log(0.1 * self.training_cameras_extent)
         self.prune(prune_mask)
 
+    @torch.no_grad()
     def mcmc_densification(self, min_opacity: float, cap_max: int) -> None:
         """Relocates low-opacity/degenerate Gaussians and adds new ones up to a cap."""
-        # relocate
         dead_mask = self._opacities.flatten() <= math.log(min_opacity / (1 - min_opacity))
         dead_mask |= self._rotations.mul(self._rotations).sum(dim=1) < 1e-8
         n_dead_gaussians = dead_mask.sum().item()
+
         if n_dead_gaussians > 0:
-            # sample existing Gaussians to copy to the dead ones, with probability proportional to opacity
             dead_indices = torch.where(dead_mask)[0]
             alive_indices = torch.where(~dead_mask)[0]
             opacities = self.opacities.flatten()
             sampled_indices = torch.multinomial(opacities[alive_indices], n_dead_gaussians, replacement=True)
             sampled_indices = alive_indices[sampled_indices]
 
-            # compute the adjusted opacities and scales
             _, inverse, counts_per_unique = sampled_indices.unique(sorted=False, return_inverse=True, return_counts=True)
-            counts = counts_per_unique[inverse] + 1  # +1 for the original Gaussian
+            counts = counts_per_unique[inverse] + 1
             adjusted_opacities, adjusted_scales = relocation_adjustment(
                 opacities[sampled_indices],
                 self._scales[sampled_indices].exp(),
@@ -385,37 +403,32 @@ class Gaussians(torch.nn.Module):
             adjusted_opacities = adjusted_opacities.clamp(min_opacity, 1.0 - torch.finfo(torch.float32).eps).logit()
             adjusted_scales = adjusted_scales.log()
 
-            # update existing sampled Gaussians
             self._opacities[sampled_indices] = adjusted_opacities
             self._scales[sampled_indices] = adjusted_scales
 
-            # copy sampled Gaussians to the dead ones
             self._means[dead_indices] = self._means[sampled_indices]
             self._sh_coefficients_0[dead_indices] = self._sh_coefficients_0[sampled_indices]
             self._sh_coefficients_rest[dead_indices] = self._sh_coefficients_rest[sampled_indices]
             self._opacities[dead_indices] = adjusted_opacities
             self._scales[dead_indices] = adjusted_scales
             self._rotations[dead_indices] = self._rotations[sampled_indices]
+            self._distance_decay[dead_indices] = self._distance_decay[sampled_indices]
 
-            # reset optimizer state for the sampled Gaussians
             reset_state(self.optimizer, indices=sampled_indices)
 
-            # if they were set, densification info and 3d filter are now no longer valid
             self._densification_info = None
             self._filter_3d = None
 
-        # add new Gaussians
         current_n_points = self._means.shape[0]
         n_target = min(cap_max, int(1.05 * current_n_points))
         n_added_gaussians = max(0, n_target - current_n_points)
+
         if n_added_gaussians > 0:
-            # sample existing Gaussians to duplicate, with probability proportional to opacity
             opacities = self.opacities.flatten()
             sampled_indices = torch.multinomial(opacities, n_added_gaussians, replacement=True)
 
-            # compute the adjusted opacities and scales
             _, inverse, counts_per_unique = sampled_indices.unique(sorted=False, return_inverse=True, return_counts=True)
-            counts = counts_per_unique[inverse] + 1  # +1 for the original Gaussian
+            counts = counts_per_unique[inverse] + 1
             adjusted_opacities, adjusted_scales = relocation_adjustment(
                 opacities[sampled_indices],
                 self._scales[sampled_indices].exp(),
@@ -424,11 +437,9 @@ class Gaussians(torch.nn.Module):
             adjusted_opacities = adjusted_opacities.clamp(min_opacity, 1.0 - torch.finfo(torch.float32).eps).logit()
             adjusted_scales = adjusted_scales.log()
 
-            # update existing sampled Gaussians
             self._opacities[sampled_indices] = adjusted_opacities
             self._scales[sampled_indices] = adjusted_scales
 
-            # add new Gaussians by duplicating the sampled ones
             param_groups = extend_param_groups(self.optimizer, {
                 'means': self._means[sampled_indices],
                 'sh_coefficients_0': self._sh_coefficients_0[sampled_indices],
@@ -436,6 +447,7 @@ class Gaussians(torch.nn.Module):
                 'opacities': adjusted_opacities,
                 'scales': adjusted_scales,
                 'rotations': self._rotations[sampled_indices],
+                'distance_decay': self._distance_decay[sampled_indices],
             })
             self._means = param_groups['means']
             self._sh_coefficients_0 = param_groups['sh_coefficients_0']
@@ -443,11 +455,10 @@ class Gaussians(torch.nn.Module):
             self._opacities = param_groups['opacities']
             self._scales = param_groups['scales']
             self._rotations = param_groups['rotations']
+            self._distance_decay = param_groups['distance_decay']
 
-            # reset optimizer state for the sampled Gaussians
             reset_state(self.optimizer, indices=sampled_indices)
 
-            # if they were set, densification info and 3d filter are now no longer valid
             self._densification_info = None
             self._filter_3d = None
 
@@ -459,7 +470,7 @@ class Gaussians(torch.nn.Module):
 
     def importance_pruning(self, scores: torch.Tensor, pruning_ratio: float) -> None:
         """Prunes the given percentage of Gaussians with the lowest importance score (from Speedy-Splat)."""
-        k = int(pruning_ratio * (scores.numel() - 1)) + 1  # kthvalue is 1-based
+        k = int(pruning_ratio * (scores.numel() - 1)) + 1
         threshold = torch.kthvalue(scores, k).values
         prune_mask = scores <= threshold
         self.prune(prune_mask)
@@ -475,29 +486,22 @@ class Gaussians(torch.nn.Module):
     @torch.no_grad()
     def training_cleanup(self, min_opacity: float) -> int:
         """Cleans the model after training."""
-        # bake 3d filter if used
         if self.use_optimized_3d_filter:
-            # nothing to do, already baked in
             self.use_optimized_3d_filter = False
         elif self.use_original_3d_filter:
-            # the 3d filter must be baked into the opacities before the scales to get the correct result
             self._opacities.data = self.raw_opacities
             self._scales.data = self.raw_scales
             self.use_original_3d_filter = False
         self._filter_3d = None
 
-        # densification info no longer needed
         self._densification_info = None
 
-        # prune low-opacity and degenerate Gaussians
         prune_mask = self.opacities.flatten() < min_opacity
         prune_mask |= self._rotations.mul(self._rotations).sum(dim=1) < 1e-8
         self.prune(prune_mask)
 
-        # sort by morton code
         self.apply_morton_ordering()
 
-        # clear any leftover gradients and delete optimizer
         self.optimizer.zero_grad()
         self.optimizer = None
 
@@ -509,29 +513,29 @@ class Gaussians(torch.nn.Module):
         if self.means.shape[0] == 0:
             return {}
 
-        # construct attributes
         means = self.means.detach().contiguous().cpu().numpy()
         sh_0 = self.sh_coefficients_0.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
         sh_rest = self.sh_coefficients_rest.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
-        opacities = self.raw_opacities.detach().contiguous().cpu().numpy()  # most viewers expect unactivated opacities
-        scales = self.raw_scales.detach().contiguous().cpu().numpy()  # most viewers expect unactivated scales
+        opacities = self.raw_opacities.detach().contiguous().cpu().numpy()
+        scales = self.raw_scales.detach().contiguous().cpu().numpy()
         rotations = self.rotations.detach().contiguous().cpu().numpy()
-        attributes = np.concatenate((means, sh_0, sh_rest, opacities, scales, rotations), axis=1)
+        distance_decay = self.raw_distance_decay.detach().contiguous().cpu().numpy()
 
-        # construct structured array
+        attributes = np.concatenate((means, sh_0, sh_rest, opacities, scales, rotations, distance_decay), axis=1)
+
         attribute_names = (
-              ['x', 'y', 'z']                                    # 3d mean
-            + ['f_dc_0', 'f_dc_1', 'f_dc_2']                     # 0-th SH degree coefficients
-            + [f'f_rest_{i}' for i in range(sh_rest.shape[-1])]  # remaining SH degree coefficients
-            + ['opacity']                                        # opacity (pre-activation)
-            + ['scale_0', 'scale_1', 'scale_2']                  # 3d scale (pre-activation)
-            + ['rot_0', 'rot_1', 'rot_2', 'rot_3']               # rotation quaternion
+              ['x', 'y', 'z']
+            + ['f_dc_0', 'f_dc_1', 'f_dc_2']
+            + [f'f_rest_{i}' for i in range(sh_rest.shape[-1])]
+            + ['opacity']
+            + ['scale_0', 'scale_1', 'scale_2']
+            + ['rot_0', 'rot_1', 'rot_2', 'rot_3']
+            + ['distance_decay']
         )
-        dtype = 'f4'  # store all attributes as float32 for compatibility
+        dtype = 'f4'
         full_dtype = [(attribute_name, dtype) for attribute_name in attribute_names]
         vertices = np.empty(means.shape[0], dtype=full_dtype)
 
-        # insert attributes into structured array
         vertices[:] = list(map(tuple, attributes))
 
         return {'vertex': vertices}
@@ -559,7 +563,6 @@ class FasterGSModel(BaseModel):
         if self.gaussians is None or not (data := self.gaussians.as_ply_dict()):
             return data
 
-        # add method-specific comments
         splat_render_mode = 'mip-0.1' if Framework.config.RENDERER.PROPER_ANTIALIASING else 'default'
         data['comments'] = [f'SplatRenderMode: {splat_render_mode}', 'Generated with NeRFICG/FasterGS']
 
