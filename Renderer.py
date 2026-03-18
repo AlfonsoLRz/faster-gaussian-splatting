@@ -73,12 +73,38 @@ def compute_clod_opacity_and_mask(
     return raw_opacities_lod, mask, eta_actual
 
 
+def compute_clod_soft_eta(
+    means: torch.Tensor,
+    raw_opacities: torch.Tensor,
+    raw_distance_decay: torch.Tensor,
+    camera_position: torch.Tensor,
+    virtual_scale: float,
+    tau: float,
+    soft_k: float = 50.0,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """Differentiable surrogate of eta_actual for CLoD regularization."""
+    if means.shape[0] == 0:
+        return torch.zeros((), dtype=raw_opacities.dtype, device=raw_opacities.device)
+
+    d = torch.linalg.norm(means - camera_position[None, :], dim=1, keepdim=True)
+    d_norm = d / d.max().clamp_min(eps)
+
+    sigma = torch.relu(raw_distance_decay)
+    alpha = raw_opacities.sigmoid()
+    alpha_lod = alpha * torch.exp(-((d_norm * virtual_scale) ** 2) / (2.0 * sigma.square() + eps))
+
+    threshold = tau * virtual_scale
+    soft_keep = torch.sigmoid(soft_k * (alpha_lod - threshold))
+    return soft_keep.mean()
+
+
 @Framework.Configurable.configure(
     SCALE_MODIFIER=1.0,
     PROPER_ANTIALIASING=False,
     FORCE_OPTIMIZED_INFERENCE=False,
     CLOD_VIRTUAL_SCALE=1.0,
-    CLOD_TAU=1e-3,
+    CLOD_TAU=1e-2,
 )
 class FasterGSRenderer(BaseRenderer):
     """Wrapper around the rasterization module from 3DGS."""
@@ -106,16 +132,16 @@ class FasterGSRenderer(BaseRenderer):
         bg_color: torch.Tensor,
         virtual_scale: float = 1.0,
         tau: float = 1e-3,
+        use_clod: bool = False,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor | float]]:
         """Renders an image for a given view."""
         gaussians = self.model.gaussians
         device = gaussians.means.device
 
-        # For the first safe prototype, do not use CLoD while densification info is being updated.
-        use_clod = (virtual_scale > 1.0) and (not update_densification_info)
+        effective_use_clod = use_clod and (not update_densification_info)
 
-        if use_clod:
-            raw_opacities_lod, mask, eta_actual = compute_clod_opacity_and_mask(
+        if effective_use_clod:
+            _, _, eta_actual_hard = compute_clod_opacity_and_mask(
                 means=gaussians.means,
                 raw_opacities=gaussians.raw_opacities,
                 raw_distance_decay=gaussians.raw_distance_decay,
@@ -124,47 +150,36 @@ class FasterGSRenderer(BaseRenderer):
                 tau=tau,
             )
 
-            if mask.any():
-                image = diff_rasterize(
-                    means=gaussians.means[mask],
-                    scales=gaussians.raw_scales[mask],
-                    rotations=gaussians.raw_rotations[mask],
-                    opacities=raw_opacities_lod[mask],
-                    distance_decay=gaussians.raw_distance_decay[mask],
-                    sh_coefficients_0=gaussians.sh_coefficients_0[mask],
-                    sh_coefficients_rest=gaussians.sh_coefficients_rest[mask],
-                    densification_info=torch.empty(0, device=device),
-                    rasterizer_settings=extract_settings(view, gaussians.active_sh_bases, bg_color, self.PROPER_ANTIALIASING),
-                    virtual_scale=virtual_scale,
-                    tau=tau,
-                )
-            else:
-                image = torch.zeros(
-                    (3, view.camera.height, view.camera.width),
-                    dtype=bg_color.dtype,
-                    device=device,
-                )
-                image[0] = bg_color[0]
-                image[1] = bg_color[1]
-                image[2] = bg_color[2]
-        else:
-            eta_actual = torch.ones((), dtype=gaussians.means.dtype, device=device)
-            image = diff_rasterize(
+            eta_actual = compute_clod_soft_eta(
                 means=gaussians.means,
-                scales=gaussians.raw_scales,
-                rotations=gaussians.raw_rotations,
-                opacities=gaussians.raw_opacities,
-                distance_decay=gaussians.raw_distance_decay,
-                sh_coefficients_0=gaussians.sh_coefficients_0,
-                sh_coefficients_rest=gaussians.sh_coefficients_rest,
-                densification_info=gaussians.densification_info if update_densification_info else torch.empty(0, device=device),
-                rasterizer_settings=extract_settings(view, gaussians.active_sh_bases, bg_color, self.PROPER_ANTIALIASING),
+                raw_opacities=gaussians.raw_opacities,
+                raw_distance_decay=gaussians.raw_distance_decay,
+                camera_position=view.position,
                 virtual_scale=virtual_scale,
                 tau=tau,
             )
+        else:
+            eta_actual = torch.ones((), dtype=gaussians.means.dtype, device=device)
+            eta_actual_hard = torch.ones((), dtype=gaussians.means.dtype, device=device)
+
+        # Always render the full Gaussian set during training.
+        image = diff_rasterize(
+            means=gaussians.means,
+            scales=gaussians.raw_scales,
+            rotations=gaussians.raw_rotations,
+            opacities=gaussians.raw_opacities,
+            distance_decay=gaussians.raw_distance_decay,
+            sh_coefficients_0=gaussians.sh_coefficients_0,
+            sh_coefficients_rest=gaussians.sh_coefficients_rest,
+            densification_info=gaussians.densification_info if update_densification_info else torch.empty(0, device=device),
+            rasterizer_settings=extract_settings(view, gaussians.active_sh_bases, bg_color, self.PROPER_ANTIALIASING),
+            virtual_scale=1.0,
+            tau=tau,
+        )
 
         return image, {
             'eta_actual': eta_actual,
+            'eta_actual_hard': eta_actual_hard,
             'virtual_scale': virtual_scale,
         }
 
@@ -222,7 +237,7 @@ class FasterGSRenderer(BaseRenderer):
                 sh_coefficients_rest=gaussians.sh_coefficients_rest,
                 densification_info=torch.empty(0, device=device),
                 rasterizer_settings=extract_settings(view, gaussians.active_sh_bases, view.camera.background_color, self.PROPER_ANTIALIASING),
-                virtual_scale=virtual_scale,
+                virtual_scale=1.0,
                 tau=tau,
             )
 
@@ -237,10 +252,13 @@ class FasterGSRenderer(BaseRenderer):
             scales=self.model.gaussians.raw_scales,
             rotations=self.model.gaussians.raw_rotations,
             opacities=self.model.gaussians.raw_opacities,
+            distance_decay=self.model.gaussians.raw_distance_decay,
             sh_coefficients_0=self.model.gaussians.sh_coefficients_0,
             sh_coefficients_rest=self.model.gaussians.sh_coefficients_rest,
             rasterizer_settings=extract_settings(view, self.model.gaussians.active_sh_bases, view.camera.background_color, self.PROPER_ANTIALIASING),
-            to_chw=to_chw
+            to_chw=to_chw,
+            virtual_scale=self.CLOD_VIRTUAL_SCALE,
+            tau=self.CLOD_TAU,
         )
         return {'rgb': image}
 

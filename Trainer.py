@@ -16,8 +16,8 @@ from Optim.Samplers.DatasetSamplers import DatasetSampler
 @Framework.Configurable.configure(
     NUM_ITERATIONS=30_000,
     DENSIFICATION_START_ITERATION=600,
-    #DENSIFICATION_END_ITERATION=14_900,
-    DENSIFICATION_END_ITERATION=2_000,
+    DENSIFICATION_END_ITERATION=14_900,
+    #DENSIFICATION_END_ITERATION=2_000,
     DENSIFICATION_INTERVAL=100,
     DENSIFICATION_GRAD_THRESHOLD=0.0002,
     DENSIFICATION_PERCENT_DENSE=0.01,
@@ -51,11 +51,11 @@ from Optim.Samplers.DatasetSamplers import DatasetSampler
     ),
     CLOD=Framework.ConfigParameterList(
         USE=True,
-        START_ITERATION=2100,
+        START_ITERATION=15_500,
         VIRTUAL_SCALE_MIN=2.0,
         VIRTUAL_SCALE_MAX=7.0,
         TAU=1e-2,
-        LAMBDA_REG=5.0,
+        LAMBDA_REG=1.0,
         ETA_EXPONENT=1.5,
     ),
     LOSS=Framework.ConfigParameterList(
@@ -73,7 +73,7 @@ from Optim.Samplers.DatasetSamplers import DatasetSampler
         LEARNING_RATE_OPACITIES=0.025,
         LEARNING_RATE_SCALES=0.005,
         LEARNING_RATE_ROTATIONS=0.001,
-        LEARNING_RATE_DISTANCE_DECAY=0.01,
+        LEARNING_RATE_DISTANCE_DECAY=0.001,
     ),
 )
 class FasterGSTrainer(GuiTrainer):
@@ -248,6 +248,7 @@ class FasterGSTrainer(GuiTrainer):
             bg_color=bg_color,
             virtual_scale=virtual_scale,
             tau=self.CLOD.TAU,
+            use_clod=use_clod,
         )
 
         if isinstance(render_output, tuple):
@@ -267,6 +268,7 @@ class FasterGSTrainer(GuiTrainer):
 
         if use_clod:
             eta_actual = lod_meta['eta_actual']
+            eta_actual_hard = lod_meta['eta_actual_hard']
             l_reg = self.clod_regularization_loss(eta_actual, virtual_scale)
             w_s = self.clod_weight(virtual_scale)
             loss = w_s * (render_loss + self.CLOD.LAMBDA_REG * l_reg)
