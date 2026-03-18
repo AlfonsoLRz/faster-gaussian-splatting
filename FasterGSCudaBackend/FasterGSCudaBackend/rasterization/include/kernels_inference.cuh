@@ -11,6 +11,23 @@ namespace cg = cooperative_groups;
 
 namespace faster_gs::rasterization::kernels::inference {
 
+    __global__ void compute_distances_cu(
+        const float3* __restrict__ means,
+        const float3* __restrict__ cam_position,
+        float* __restrict__ distances,
+        const uint n_primitives)
+    {
+        const uint idx = blockIdx.x * blockDim.x + threadIdx.x;
+        if (idx >= n_primitives) return;
+
+        const float3 mean = means[idx];
+        const float3 cam = cam_position[0];
+        const float dx = mean.x - cam.x;
+        const float dy = mean.y - cam.y;
+        const float dz = mean.z - cam.z;
+        distances[idx] = sqrtf(dx * dx + dy * dy + dz * dz);
+    }
+
     __global__ void preprocess_cu(
         const float3* __restrict__ means,
         const float3* __restrict__ scales,
@@ -21,6 +38,8 @@ namespace faster_gs::rasterization::kernels::inference {
         const float3* __restrict__ sh_coefficients_rest,
         const float4* __restrict__ w2c,
         const float3* __restrict__ cam_position,
+        const float* __restrict__ primitive_distances,
+        const float max_distance,
         uint* __restrict__ primitive_depth_keys,
         uint* __restrict__ primitive_indices,
         uint* __restrict__ primitive_n_touched_tiles,
@@ -74,6 +93,25 @@ namespace faster_gs::rasterization::kernels::inference {
         const float raw_opacity = opacities[primitive_idx];
         float opacity = sigmoid(raw_opacity);
         if (config::original_opacity_interpretation && opacity < config::min_alpha_threshold) active = false;
+
+        // CLoD hard mask in inference preprocess
+        if (active && virtual_scale > 1.0f) {
+            const float distance = primitive_distances[primitive_idx];
+            const float distance_norm = distance / fmaxf(max_distance, 1e-8f);
+
+            const float sigma = fmaxf(distance_decay[primitive_idx], 0.0f);
+            const float denom = 2.0f * sigma * sigma + 1e-8f;
+            const float x_clod = distance_norm * virtual_scale;
+            const float alpha_lod = opacity * __expf(-(x_clod * x_clod) / denom);
+
+            if (alpha_lod <= tau * virtual_scale) active = false;
+            opacity = alpha_lod;
+
+            if (config::original_opacity_interpretation && opacity < config::min_alpha_threshold) active = false;
+        }
+
+        // early exit if whole warp is inactive
+        if (warp.ballot(active) == 0) return;
 
         // compute 3d covariance from scale and rotation
         const float3 raw_scale = scales[primitive_idx];

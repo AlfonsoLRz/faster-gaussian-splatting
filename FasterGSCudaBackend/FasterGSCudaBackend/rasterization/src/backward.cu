@@ -49,36 +49,41 @@ void faster_gs::rasterization::backward(
 
     PrimitiveBuffers primitive_buffers = PrimitiveBuffers::from_blob(primitive_buffers_blob, n_primitives);
     TileBuffers tile_buffers = TileBuffers::from_blob(tile_buffers_blob, n_tiles);
-    BucketBuffers bucket_buffers = BucketBuffers::from_blob(bucket_buffers_blob, n_buckets);
+    BucketBuffers bucket_buffers{};
+    if (n_buckets > 0) {
+        bucket_buffers = BucketBuffers::from_blob(bucket_buffers_blob, n_buckets);
+    }
 
     // note that with c++20 one could use a templated lambda to improve readability here
     auto dispatch_rasterize_backward = [&](const uint* instance_primitive_indices) {
-        kernels::backward::blend_backward_cu<<<n_buckets, 32>>>(
-            tile_buffers.instance_ranges,
-            tile_buffers.buckets_offset,
-            instance_primitive_indices,
-            primitive_buffers.mean2d,
-            primitive_buffers.conic_opacity,
-            primitive_buffers.color,
-            bg_color,
-            grad_image,
-            image,
-            tile_buffers.final_transmittances,
-            tile_buffers.max_n_processed,
-            tile_buffers.n_processed,
-            bucket_buffers.tile_index,
-            bucket_buffers.color_transmittance,
-            grad_mean2d_helper,
-            grad_conic_helper,
-            grad_opacities,
-            grad_sh_coefficients_0,
-            n_primitives,
-            width,
-            height,
-            grid.x,
-            proper_antialiasing
-        );
-        CHECK_CUDA(config::debug, "blend_backward")
+        if (n_buckets > 0) {
+            kernels::backward::blend_backward_cu<<<n_buckets, 32>>>(
+                tile_buffers.instance_ranges,
+                tile_buffers.buckets_offset,
+                instance_primitive_indices,
+                primitive_buffers.mean2d,
+                primitive_buffers.conic_opacity,
+                primitive_buffers.color,
+                bg_color,
+                grad_image,
+                image,
+                tile_buffers.final_transmittances,
+                tile_buffers.max_n_processed,
+                tile_buffers.n_processed,
+                bucket_buffers.tile_index,
+                bucket_buffers.color_transmittance,
+                grad_mean2d_helper,
+                grad_conic_helper,
+                grad_opacities,
+                grad_sh_coefficients_0,
+                n_primitives,
+                width,
+                height,
+                grid.x,
+                proper_antialiasing
+            );
+            CHECK_CUDA(config::debug, "blend_backward")
+        }
     };
     if (end_bit <= 16) {
         auto instance_buffers = InstanceBuffers<ushort>::from_blob(instance_buffers_blob, n_instances, end_bit);
