@@ -109,7 +109,7 @@ class Gaussians(torch.nn.Module):
     @property
     def distance_decay(self) -> torch.Tensor:
         """Returns the activated distance decay factors (N, 1)."""
-        return torch.nn.functional.softplus(self._distance_decay)
+        return torch.relu(self._distance_decay)
 
     @property
     def raw_distance_decay(self) -> torch.Tensor:

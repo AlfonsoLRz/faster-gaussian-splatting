@@ -45,15 +45,18 @@ faster_gs::rasterization::forward_wrapper(
 
     const int n_primitives = means.size(0);
     const int total_sh_bases = sh_coefficients_rest.size(1);
-    const torch::TensorOptions float_options = torch::TensorOptions().dtype(torch::kFloat).device(torch::kCUDA);
-    const torch::TensorOptions byte_options = torch::TensorOptions().dtype(torch::kByte).device(torch::kCUDA);
+
+    const torch::TensorOptions float_options =
+        torch::TensorOptions().dtype(torch::kFloat).device(torch::kCUDA);
+    const torch::TensorOptions byte_options =
+        torch::TensorOptions().dtype(torch::kByte).device(torch::kCUDA);
 
     torch::Tensor image = torch::empty({3, height, width}, float_options);
     torch::Tensor primitive_buffers = torch::empty({0}, byte_options);
     torch::Tensor tile_buffers = torch::empty({0}, byte_options);
     torch::Tensor instance_buffers = torch::empty({0}, byte_options);
     torch::Tensor bucket_buffers = torch::empty({0}, byte_options);
-    torch::Tensor max_distance_buffer = torch::empty({n_primitives}, float_options);
+    torch::Tensor primitive_distances = torch::empty({n_primitives}, float_options);
 
     const std::function<char*(size_t)> resize_primitive_buffers = resize_function_wrapper(primitive_buffers);
     const std::function<char*(size_t)> resize_tile_buffers = resize_function_wrapper(tile_buffers);
@@ -76,7 +79,7 @@ faster_gs::rasterization::forward_wrapper(
         reinterpret_cast<float3*>(cam_position.contiguous().data_ptr<float>()),
         reinterpret_cast<float3*>(bg_color.contiguous().data_ptr<float>()),
         image.data_ptr<float>(),
-        max_distance_buffer.data_ptr<float>(),
+        primitive_distances.data_ptr<float>(),
         n_primitives,
         active_sh_bases,
         total_sh_bases,
@@ -95,12 +98,25 @@ faster_gs::rasterization::forward_wrapper(
 
     return {
         image,
-        primitive_buffers, tile_buffers, instance_buffers, bucket_buffers,
-        n_instances, n_buckets, instance_primitive_indices_selector
+        primitive_buffers,
+        tile_buffers,
+        instance_buffers,
+        bucket_buffers,
+        n_instances,
+        n_buckets,
+        instance_primitive_indices_selector
     };
 }
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+std::tuple<
+    torch::Tensor,
+    torch::Tensor,
+    torch::Tensor,
+    torch::Tensor,
+    torch::Tensor,
+    torch::Tensor,
+    torch::Tensor
+>
 faster_gs::rasterization::backward_wrapper(
     torch::Tensor& densification_info,
     const torch::Tensor& grad_image,
@@ -109,6 +125,7 @@ faster_gs::rasterization::backward_wrapper(
     const torch::Tensor& scales,
     const torch::Tensor& rotations,
     const torch::Tensor& opacities,
+    const torch::Tensor& distance_decay,
     const torch::Tensor& sh_coefficients_rest,
     const torch::Tensor& primitive_buffers,
     const torch::Tensor& tile_buffers,
@@ -127,17 +144,23 @@ faster_gs::rasterization::backward_wrapper(
     const float near_plane,
     const float far_plane,
     const bool proper_antialiasing,
+    const float virtual_scale,
+    const float tau,
     const int n_instances,
     const int n_buckets,
     const int instance_primitive_indices_selector)
 {
     const int n_primitives = means.size(0);
     const int total_sh_bases = sh_coefficients_rest.size(1);
-    const torch::TensorOptions float_options = torch::TensorOptions().dtype(torch::kFloat).device(torch::kCUDA);
+
+    const torch::TensorOptions float_options =
+        torch::TensorOptions().dtype(torch::kFloat).device(torch::kCUDA);
+
     torch::Tensor grad_means = torch::zeros({n_primitives, 3}, float_options);
     torch::Tensor grad_scales = torch::zeros({n_primitives, 3}, float_options);
     torch::Tensor grad_rotations = torch::zeros({n_primitives, 4}, float_options);
     torch::Tensor grad_opacities = torch::zeros({n_primitives, 1}, float_options);
+    torch::Tensor grad_distance_decay = torch::zeros({n_primitives, 1}, float_options);
     torch::Tensor grad_sh_coefficients_0 = torch::zeros({n_primitives, 1, 3}, float_options);
     torch::Tensor grad_sh_coefficients_rest = torch::zeros({n_primitives, total_sh_bases, 3}, float_options);
     torch::Tensor grad_mean2d_helper = torch::zeros({n_primitives, 2}, float_options);
@@ -152,6 +175,7 @@ faster_gs::rasterization::backward_wrapper(
         reinterpret_cast<float3*>(scales.data_ptr<float>()),
         reinterpret_cast<float4*>(rotations.data_ptr<float>()),
         opacities.data_ptr<float>(),
+        distance_decay.data_ptr<float>(),
         reinterpret_cast<float3*>(sh_coefficients_rest.data_ptr<float>()),
         reinterpret_cast<float4*>(w2c.contiguous().data_ptr<float>()),
         reinterpret_cast<float3*>(cam_position.contiguous().data_ptr<float>()),
@@ -164,6 +188,7 @@ faster_gs::rasterization::backward_wrapper(
         reinterpret_cast<float3*>(grad_scales.data_ptr<float>()),
         reinterpret_cast<float4*>(grad_rotations.data_ptr<float>()),
         reinterpret_cast<float*>(grad_opacities.data_ptr<float>()),
+        reinterpret_cast<float*>(grad_distance_decay.data_ptr<float>()),
         reinterpret_cast<float3*>(grad_sh_coefficients_0.data_ptr<float>()),
         reinterpret_cast<float3*>(grad_sh_coefficients_rest.data_ptr<float>()),
         reinterpret_cast<float2*>(grad_mean2d_helper.data_ptr<float>()),
@@ -181,10 +206,20 @@ faster_gs::rasterization::backward_wrapper(
         focal_y,
         center_x,
         center_y,
-        proper_antialiasing
+        proper_antialiasing,
+        virtual_scale,
+        tau
     );
 
-    return {grad_means, grad_scales, grad_rotations, grad_opacities, grad_sh_coefficients_0, grad_sh_coefficients_rest};
+    return {
+        grad_means,
+        grad_scales,
+        grad_rotations,
+        grad_opacities,
+        grad_distance_decay,
+        grad_sh_coefficients_0,
+        grad_sh_coefficients_rest
+    };
 }
 
 torch::Tensor
@@ -223,14 +258,20 @@ faster_gs::rasterization::inference_wrapper(
 
     const int n_primitives = means.size(0);
     const int total_sh_bases = sh_coefficients_rest.size(1);
-    const torch::TensorOptions float_options = torch::TensorOptions().dtype(torch::kFloat).device(torch::kCUDA);
-    const torch::TensorOptions byte_options = torch::TensorOptions().dtype(torch::kByte).device(torch::kCUDA);
 
-    torch::Tensor image = to_chw ? torch::empty({3, height, width}, float_options) : torch::empty({height, width, 3}, float_options);
+    const torch::TensorOptions float_options =
+        torch::TensorOptions().dtype(torch::kFloat).device(torch::kCUDA);
+    const torch::TensorOptions byte_options =
+        torch::TensorOptions().dtype(torch::kByte).device(torch::kCUDA);
+
+    torch::Tensor image = to_chw
+        ? torch::empty({3, height, width}, float_options)
+        : torch::empty({height, width, 3}, float_options);
+
     torch::Tensor primitive_buffers = torch::empty({0}, byte_options);
     torch::Tensor tile_buffers = torch::empty({0}, byte_options);
     torch::Tensor instance_buffers = torch::empty({0}, byte_options);
-    torch::Tensor max_distance_buffer = torch::empty({n_primitives}, float_options);
+    torch::Tensor primitive_distances = torch::empty({n_primitives}, float_options);
 
     const std::function<char*(size_t)> resize_primitive_buffers = resize_function_wrapper(primitive_buffers);
     const std::function<char*(size_t)> resize_tile_buffers = resize_function_wrapper(tile_buffers);
@@ -251,7 +292,7 @@ faster_gs::rasterization::inference_wrapper(
         reinterpret_cast<float3*>(cam_position.contiguous().data_ptr<float>()),
         reinterpret_cast<float3*>(bg_color.contiguous().data_ptr<float>()),
         image.data_ptr<float>(),
-        max_distance_buffer.data_ptr<float>(),
+        primitive_distances.data_ptr<float>(),
         n_primitives,
         active_sh_bases,
         total_sh_bases,
@@ -264,9 +305,9 @@ faster_gs::rasterization::inference_wrapper(
         near_plane,
         far_plane,
         proper_antialiasing,
-        to_chw,
         virtual_scale,
-        tau
+        tau,
+        to_chw
     );
 
     return image;
@@ -295,12 +336,24 @@ faster_gs::rasterization::pruning_scores_wrapper(
     const float far_plane,
     const bool proper_antialiasing)
 {
+    CHECK_INPUT(config::debug, scores, "scores");
+    CHECK_INPUT(config::debug, means, "means");
+    CHECK_INPUT(config::debug, scales, "scales");
+    CHECK_INPUT(config::debug, rotations, "rotations");
+    CHECK_INPUT(config::debug, opacities, "opacities");
+    CHECK_INPUT(config::debug, sh_coefficients_0, "sh_coefficients_0");
+    CHECK_INPUT(config::debug, sh_coefficients_rest, "sh_coefficients_rest");
+
     const int n_primitives = means.size(0);
     const int total_sh_bases = sh_coefficients_rest.size(1);
-    const torch::TensorOptions byte_options = torch::TensorOptions().dtype(torch::kByte).device(torch::kCUDA);
+
+    const torch::TensorOptions byte_options =
+        torch::TensorOptions().dtype(torch::kByte).device(torch::kCUDA);
+
     torch::Tensor primitive_buffers = torch::empty({0}, byte_options);
     torch::Tensor tile_buffers = torch::empty({0}, byte_options);
     torch::Tensor instance_buffers = torch::empty({0}, byte_options);
+
     const std::function<char*(size_t)> resize_primitive_buffers = resize_function_wrapper(primitive_buffers);
     const std::function<char*(size_t)> resize_tile_buffers = resize_function_wrapper(tile_buffers);
     const std::function<char*(size_t)> resize_instance_buffers = resize_function_wrapper(instance_buffers);

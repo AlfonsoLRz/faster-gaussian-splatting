@@ -4,6 +4,15 @@
 #include "rasterization_config.h"
 #include "utils.h"
 #include "helper_math.h"
+#include <cub/cub.cuh>
+
+namespace faster_gs::rasterization::kernels::forward {
+    __global__ void compute_distances_cu(
+        const float3* __restrict__ means,
+        const float3* __restrict__ cam_position,
+        float* __restrict__ primitive_distances,
+        const uint n_primitives);
+}
 
 void faster_gs::rasterization::backward(
     const float* grad_image,
@@ -12,6 +21,7 @@ void faster_gs::rasterization::backward(
     const float3* scales,
     const float4* rotations,
     const float* opacities,
+    const float* distance_decay,
     const float3* sh_coefficients_rest,
     const float4* w2c,
     const float3* cam_position,
@@ -24,6 +34,7 @@ void faster_gs::rasterization::backward(
     float3* grad_scales,
     float4* grad_rotations,
     float* grad_opacities,
+    float* grad_distance_decay,
     float3* grad_sh_coefficients_0,
     float3* grad_sh_coefficients_rest,
     float2* grad_mean2d_helper,
@@ -41,7 +52,9 @@ void faster_gs::rasterization::backward(
     const float focal_y,
     const float center_x,
     const float center_y,
-    const bool proper_antialiasing)
+    const bool proper_antialiasing,
+    const float virtual_scale,
+    const float tau)
 {
     const dim3 grid(div_round_up(width, config::tile_width), div_round_up(height, config::tile_height), 1);
     const int n_tiles = grid.x * grid.y;
@@ -54,7 +67,6 @@ void faster_gs::rasterization::backward(
         bucket_buffers = BucketBuffers::from_blob(bucket_buffers_blob, n_buckets);
     }
 
-    // note that with c++20 one could use a templated lambda to improve readability here
     auto dispatch_rasterize_backward = [&](const uint* instance_primitive_indices) {
         if (n_buckets > 0) {
             kernels::backward::blend_backward_cu<<<n_buckets, 32>>>(
@@ -85,22 +97,69 @@ void faster_gs::rasterization::backward(
             CHECK_CUDA(config::debug, "blend_backward")
         }
     };
+
     if (end_bit <= 16) {
         auto instance_buffers = InstanceBuffers<ushort>::from_blob(instance_buffers_blob, n_instances, end_bit);
         instance_buffers.primitive_indices.selector = instance_primitive_indices_selector;
         dispatch_rasterize_backward(instance_buffers.primitive_indices.Current());
-    }
-    else {
+    } else {
         auto instance_buffers = InstanceBuffers<uint>::from_blob(instance_buffers_blob, n_instances, end_bit);
         instance_buffers.primitive_indices.selector = instance_primitive_indices_selector;
         dispatch_rasterize_backward(instance_buffers.primitive_indices.Current());
     }
 
-    kernels::backward::preprocess_backward_cu<<<div_round_up(n_primitives, config::block_size_preprocess_backward), config::block_size_preprocess_backward>>>(
+    float max_distance = 1.0f;
+    if (virtual_scale > 1.0f && n_primitives > 0) {
+        float* primitive_distances = nullptr;
+        float* max_distance_gpu = nullptr;
+        void* reduce_workspace = nullptr;
+        size_t reduce_workspace_size = 0;
+
+        cudaMalloc(&primitive_distances, sizeof(float) * n_primitives);
+        cudaMalloc(&max_distance_gpu, sizeof(float));
+
+        kernels::forward::compute_distances_cu<<<div_round_up(n_primitives, config::block_size_preprocess), config::block_size_preprocess>>>(
+            means,
+            cam_position,
+            primitive_distances,
+            n_primitives
+        );
+        CHECK_CUDA(config::debug, "compute_distances_backward")
+
+        cub::DeviceReduce::Max(
+            reduce_workspace,
+            reduce_workspace_size,
+            primitive_distances,
+            max_distance_gpu,
+            n_primitives
+        );
+        cudaMalloc(&reduce_workspace, reduce_workspace_size);
+
+        cub::DeviceReduce::Max(
+            reduce_workspace,
+            reduce_workspace_size,
+            primitive_distances,
+            max_distance_gpu,
+            n_primitives
+        );
+        CHECK_CUDA(config::debug, "cub::DeviceReduce::Max (max_distance_backward)")
+
+        cudaMemcpy(&max_distance, max_distance_gpu, sizeof(float), cudaMemcpyDeviceToHost);
+
+        cudaFree(reduce_workspace);
+        cudaFree(max_distance_gpu);
+        cudaFree(primitive_distances);
+    }
+
+    kernels::backward::preprocess_backward_cu<<<
+        div_round_up(n_primitives, config::block_size_preprocess_backward),
+        config::block_size_preprocess_backward
+    >>>(
         means,
         scales,
         rotations,
         opacities,
+        distance_decay,
         sh_coefficients_rest,
         w2c,
         cam_position,
@@ -111,6 +170,7 @@ void faster_gs::rasterization::backward(
         grad_scales,
         grad_rotations,
         grad_opacities,
+        grad_distance_decay,
         grad_sh_coefficients_0,
         grad_sh_coefficients_rest,
         densification_info,
@@ -123,8 +183,9 @@ void faster_gs::rasterization::backward(
         focal_y,
         center_x,
         center_y,
-        proper_antialiasing
+        proper_antialiasing,
+        virtual_scale,
+        max_distance
     );
     CHECK_CUDA(config::debug, "preprocess_backward")
-
 }

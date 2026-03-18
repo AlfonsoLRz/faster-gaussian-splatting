@@ -17,6 +17,7 @@ namespace faster_gs::rasterization::kernels::backward {
         const float3* __restrict__ scales,
         const float4* __restrict__ rotations,
         const float* __restrict__ opacities,
+        const float* __restrict__ distance_decay,
         const float3* __restrict__ sh_coefficients_rest,
         const float4* __restrict__ w2c,
         const float3* __restrict__ cam_position,
@@ -27,6 +28,7 @@ namespace faster_gs::rasterization::kernels::backward {
         float3* __restrict__ grad_scales,
         float4* __restrict__ grad_rotations,
         float* __restrict__ grad_opacities,
+        float* __restrict__ grad_distance_decay,
         float3* __restrict__ grad_sh_coefficients_0,
         float3* __restrict__ grad_sh_coefficients_rest,
         float* __restrict__ densification_info,
@@ -39,7 +41,9 @@ namespace faster_gs::rasterization::kernels::backward {
         const float focal_y,
         const float center_x,
         const float center_y,
-        const bool proper_antialiasing)
+        const bool proper_antialiasing,
+        const float virtual_scale,
+        const float max_distance)
     {
         const uint primitive_idx = blockIdx.x * blockDim.x + threadIdx.x;
         if (primitive_idx >= n_primitives || primitive_n_touched_tiles[primitive_idx] == 0) return;
@@ -135,28 +139,92 @@ namespace faster_gs::rasterization::kernels::backward {
 
         // account for proper antialiasing
         if (proper_antialiasing) {
-            const float opacity = sigmoid(opacities[primitive_idx]);
-            const float dL_dopacity_conv_factor = grad_opacities[primitive_idx];
-            const float determinant_raw = a_raw * c_raw - bb;
-            const float radicand = fmaxf(determinant_raw / determinant, 0.0f);
-            const float conv_factor = sqrtf(radicand);
-            const float dL_dopacity = dL_dopacity_conv_factor * conv_factor * opacity * (1.0f - opacity);
-            grad_opacities[primitive_idx] = dL_dopacity;
-            // the remaining part works but causes exploding gradients that lead to lots of degenerate Gaussians
-            if constexpr (!config::detach_dilation_proper_antialiasing_from_cov2d) {
-                // based on https://github.com/nerfstudio-project/gsplat/blob/65042cc501d1cdbefaf1d6f61a9a47575eec8c71/gsplat/cuda/include/Utils.cuh#L390
-                const float3 conic = make_float3(
-                    c / determinant,
-                    -b / determinant,
-                    a / determinant
+            const float raw_opacity = opacities[primitive_idx];
+            const float alpha_base = sigmoid(raw_opacity);
+
+            float sigma = 0.0f;
+            float distance = 0.0f;
+            float distance_norm = 0.0f;
+            float denom_clod = 1.0f;
+            float decay_clod = 1.0f;
+            float alpha_after_clod = alpha_base;
+
+            if (virtual_scale > 1.0f) {
+                const float3 cam = cam_position[0];
+                const float3 delta_cam = make_float3(
+                    mean3d.x - cam.x,
+                    mean3d.y - cam.y,
+                    mean3d.z - cam.z
                 );
-                const float determinant_conic = conic.x * conic.z - conic.y * conic.y;
-                const float dL_dradicand = dL_dopacity_conv_factor * opacity / fmaxf(2.0f * conv_factor, 1e-6f);
-                const float one_minus_radicand = 1.0f - radicand;
-                dL_dcov2d.x += dL_dradicand * (one_minus_radicand * conic.x - kernel_size * determinant_conic);
-                dL_dcov2d.y += dL_dradicand * 2.0f * one_minus_radicand * conic.y;
-                dL_dcov2d.z += dL_dradicand * (one_minus_radicand * conic.z - kernel_size * determinant_conic);
+                distance = length(delta_cam);
+                distance_norm = distance / fmaxf(max_distance, 1e-8f);
+
+                sigma = fmaxf(distance_decay[primitive_idx], 0.0f);
+                denom_clod = 2.0f * sigma * sigma + 1e-8f;
+                const float x_clod = distance_norm * virtual_scale;
+                decay_clod = __expf(-(x_clod * x_clod) / denom_clod);
+                alpha_after_clod = alpha_base * decay_clod;
             }
+
+            float dL_dalpha_after_clod = grad_opacities[primitive_idx];
+
+            if (proper_antialiasing) {
+                const float determinant_raw = a_raw * c_raw - bb;
+                const float radicand = fmaxf(determinant_raw / determinant, 0.0f);
+                const float conv_factor = sqrtf(radicand);
+
+                dL_dalpha_after_clod *= conv_factor;
+
+                if constexpr (!config::detach_dilation_proper_antialiasing_from_cov2d) {
+                    const float3 conic = make_float3(
+                        c / determinant,
+                        -b / determinant,
+                        a / determinant
+                    );
+                    const float determinant_conic = conic.x * conic.z - conic.y * conic.y;
+                    const float dL_dradicand = grad_opacities[primitive_idx] * alpha_after_clod / fmaxf(2.0f * conv_factor, 1e-6f);
+                    const float one_minus_radicand = 1.0f - radicand;
+                    dL_dcov2d.x += dL_dradicand * (one_minus_radicand * conic.x - kernel_size * determinant_conic);
+                    dL_dcov2d.y += dL_dradicand * 2.0f * one_minus_radicand * conic.y;
+                    dL_dcov2d.z += dL_dradicand * (one_minus_radicand * conic.z - kernel_size * determinant_conic);
+                }
+            }
+
+            float dL_draw_opacity = dL_dalpha_after_clod * alpha_base * (1.0f - alpha_base);
+
+            if (virtual_scale > 1.0f) {
+                dL_draw_opacity = dL_dalpha_after_clod * decay_clod * alpha_base * (1.0f - alpha_base);
+
+                if (distance_decay[primitive_idx] > 0.0f) {
+                    const float A = (distance_norm * virtual_scale) * (distance_norm * virtual_scale);
+                    const float d_alpha_d_sigma =
+                        alpha_base * decay_clod * (2.0f * A * sigma) / (denom_clod * denom_clod);
+                    grad_distance_decay[primitive_idx] = dL_dalpha_after_clod * d_alpha_d_sigma;
+                }
+
+                if (distance > 1e-8f) {
+                    const float d_alpha_d_distance =
+                        alpha_base * decay_clod *
+                        (-2.0f * distance * virtual_scale * virtual_scale) /
+                        (fmaxf(max_distance * max_distance, 1e-8f) * denom_clod);
+
+                    const float3 cam = cam_position[0];
+                    const float3 delta_cam = make_float3(
+                        mean3d.x - cam.x,
+                        mean3d.y - cam.y,
+                        mean3d.z - cam.z
+                    );
+                    const float inv_distance = 1.0f / distance;
+                    const float3 d_distance_d_mean = make_float3(
+                        delta_cam.x * inv_distance,
+                        delta_cam.y * inv_distance,
+                        delta_cam.z * inv_distance
+                    );
+                    grad_means[primitive_idx] += dL_dalpha_after_clod * d_alpha_d_distance * d_distance_d_mean;
+                }
+            }
+
+            grad_opacities[primitive_idx] = dL_draw_opacity;
         }
 
         // 3d covariance gradient
@@ -462,8 +530,7 @@ namespace faster_gs::rasterization::kernels::backward {
             atomicAdd(&grad_conic[primitive_idx], dL_dconic_accum.x);
             atomicAdd(&grad_conic[n_primitives + primitive_idx], dL_dconic_accum.y);
             atomicAdd(&grad_conic[2 * n_primitives + primitive_idx], dL_dconic_accum.z);
-            const float dL_dopacity = proper_antialiasing ? dL_dopacity_accum : opacity * (1.0f - opacity) * dL_dopacity_accum;
-            atomicAdd(&grad_opacity[primitive_idx], dL_dopacity);
+            atomicAdd(&grad_opacity[primitive_idx], dL_dopacity_accum);
             atomicAdd(&grad_sh_coefficients_0[primitive_idx].x, dL_dcolor_accum.x);
             atomicAdd(&grad_sh_coefficients_0[primitive_idx].y, dL_dcolor_accum.y);
             atomicAdd(&grad_sh_coefficients_0[primitive_idx].z, dL_dcolor_accum.z);

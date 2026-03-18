@@ -1,7 +1,6 @@
 """FasterGS/Renderer.py"""
 
 import math
-
 import torch
 
 import Framework
@@ -9,10 +8,14 @@ from Cameras.Perspective import PerspectiveCamera
 from Datasets.Base import BaseDataset
 from Datasets.utils import View
 from Logging import Logger
-from Methods.Base.Renderer import BaseModel
-from Methods.Base.Renderer import BaseRenderer
+from Methods.Base.Renderer import BaseModel, BaseRenderer
 from Methods.FasterGS.Model import FasterGSModel
-from Methods.FasterGS.FasterGSCudaBackend import diff_rasterize, rasterize, update_pruning_scores, RasterizerSettings
+from Methods.FasterGS.FasterGSCudaBackend import (
+    diff_rasterize,
+    rasterize,
+    update_pruning_scores,
+    RasterizerSettings,
+)
 
 
 def extract_settings(
@@ -42,21 +45,19 @@ def extract_settings(
     )
 
 
-def compute_clod_opacity_and_mask(
+def compute_clod_soft_and_hard_eta(
     means: torch.Tensor,
     raw_opacities: torch.Tensor,
     raw_distance_decay: torch.Tensor,
     camera_position: torch.Tensor,
     virtual_scale: float,
     tau: float,
+    soft_k: float = 64.0,
     eps: float = 1e-8,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Computes CLoD opacities, hard mask, and hard eta_actual."""
+) -> tuple[torch.Tensor, torch.Tensor]:
     if means.shape[0] == 0:
-        empty_mask = torch.zeros((0,), dtype=torch.bool, device=means.device)
-        empty_opacities = raw_opacities
-        eta_actual = torch.zeros((), dtype=raw_opacities.dtype, device=raw_opacities.device)
-        return empty_opacities, empty_mask, eta_actual
+        zero = torch.zeros((), dtype=raw_opacities.dtype, device=raw_opacities.device)
+        return zero, zero
 
     d = torch.linalg.norm(means - camera_position[None, :], dim=1, keepdim=True)
     d_norm = d / d.max().clamp_min(eps)
@@ -66,12 +67,13 @@ def compute_clod_opacity_and_mask(
 
     alpha_lod = alpha * torch.exp(-((d_norm * virtual_scale) ** 2) / (2.0 * sigma.square() + eps))
     threshold = tau * virtual_scale
-    mask = (alpha_lod > threshold).squeeze(-1)
 
-    raw_opacities_lod = alpha_lod.clamp(1e-6, 1.0 - 1e-6).logit()
-    eta_actual = mask.float().mean()
+    hard_mask = (alpha_lod > threshold).float()
+    soft_mask = torch.sigmoid(soft_k * (alpha_lod - threshold))
 
-    return raw_opacities_lod, mask, eta_actual
+    eta_hard = hard_mask.mean()
+    eta_soft = soft_mask.mean()
+    return eta_soft, eta_hard
 
 
 @Framework.Configurable.configure(
@@ -92,13 +94,11 @@ class FasterGSRenderer(BaseRenderer):
             Logger.log_warning(f'FasterGS renderer not implemented in multi-GPU mode: using GPU {Framework.config.GLOBAL.GPU_INDICES[0]}')
 
     def render_image(self, view: View, to_chw: bool = False, benchmark: bool = False) -> dict[str, torch.Tensor]:
-        """Renders an image for a given view."""
         if benchmark or self.FORCE_OPTIMIZED_INFERENCE:
             return self.render_image_benchmark(view, to_chw=to_chw or benchmark)
-        elif self.model.training:
+        if self.model.training:
             raise Framework.RendererError('please directly call render_image_training() instead of render_image() during training')
-        else:
-            return self.render_image_inference(view, to_chw)
+        return self.render_image_inference(view, to_chw)
 
     def render_image_training(
         self,
@@ -109,25 +109,12 @@ class FasterGSRenderer(BaseRenderer):
         tau: float = 1e-3,
         use_clod: bool = False,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor | float]]:
-        """Renders an image for a given view."""
         gaussians = self.model.gaussians
         device = gaussians.means.device
 
         effective_use_clod = use_clod and (not update_densification_info)
+        actual_virtual_scale = virtual_scale if effective_use_clod else 1.0
 
-        if effective_use_clod:
-            _, _, eta_actual = compute_clod_opacity_and_mask(
-                means=gaussians.means,
-                raw_opacities=gaussians.raw_opacities,
-                raw_distance_decay=gaussians.raw_distance_decay,
-                camera_position=view.position,
-                virtual_scale=virtual_scale,
-                tau=tau,
-            )
-        else:
-            eta_actual = torch.ones((), dtype=gaussians.means.dtype, device=device)
-
-        # Keep training render stable: always render full Gaussian set.
         image = diff_rasterize(
             means=gaussians.means,
             scales=gaussians.raw_scales,
@@ -138,28 +125,12 @@ class FasterGSRenderer(BaseRenderer):
             sh_coefficients_rest=gaussians.sh_coefficients_rest,
             densification_info=gaussians.densification_info if update_densification_info else torch.empty(0, device=device),
             rasterizer_settings=extract_settings(view, gaussians.active_sh_bases, bg_color, self.PROPER_ANTIALIASING),
-            virtual_scale=1.0,
+            virtual_scale=actual_virtual_scale,
             tau=tau,
         )
 
-        return image, {
-            'eta_actual': eta_actual,
-            'eta_actual_hard': eta_actual,
-            'virtual_scale': virtual_scale,
-        }
-
-    @torch.no_grad()
-    def render_image_inference(self, view: View, to_chw: bool = False) -> dict[str, torch.Tensor]:
-        """Renders an image for a given view."""
-        gaussians = self.model.gaussians
-        device = gaussians.means.device
-        virtual_scale = self.CLOD_VIRTUAL_SCALE
-        tau = self.CLOD_TAU
-
-        use_clod = virtual_scale > 1.0
-
-        if use_clod:
-            raw_opacities_lod, mask, _ = compute_clod_opacity_and_mask(
+        if effective_use_clod:
+            eta_soft, eta_hard = compute_clod_soft_and_hard_eta(
                 means=gaussians.means,
                 raw_opacities=gaussians.raw_opacities,
                 raw_distance_decay=gaussians.raw_distance_decay,
@@ -167,51 +138,44 @@ class FasterGSRenderer(BaseRenderer):
                 virtual_scale=virtual_scale,
                 tau=tau,
             )
-
-            if mask.any():
-                image = diff_rasterize(
-                    means=gaussians.means[mask],
-                    scales=gaussians.raw_scales[mask] + math.log(max(self.SCALE_MODIFIER, 1e-6)),
-                    rotations=gaussians.raw_rotations[mask],
-                    opacities=raw_opacities_lod[mask],
-                    distance_decay=gaussians.raw_distance_decay[mask],
-                    sh_coefficients_0=gaussians.sh_coefficients_0[mask],
-                    sh_coefficients_rest=gaussians.sh_coefficients_rest[mask],
-                    densification_info=torch.empty(0, device=device),
-                    rasterizer_settings=extract_settings(view, gaussians.active_sh_bases, view.camera.background_color, self.PROPER_ANTIALIASING),
-                    virtual_scale=virtual_scale,
-                    tau=tau,
-                )
-            else:
-                image = torch.zeros(
-                    (3, view.camera.height, view.camera.width),
-                    dtype=view.camera.background_color.dtype,
-                    device=device,
-                )
-                image[0] = view.camera.background_color[0]
-                image[1] = view.camera.background_color[1]
-                image[2] = view.camera.background_color[2]
         else:
-            image = diff_rasterize(
-                means=gaussians.means,
-                scales=gaussians.raw_scales + math.log(max(self.SCALE_MODIFIER, 1e-6)),
-                rotations=gaussians.raw_rotations,
-                opacities=gaussians.raw_opacities,
-                distance_decay=gaussians.raw_distance_decay,
-                sh_coefficients_0=gaussians.sh_coefficients_0,
-                sh_coefficients_rest=gaussians.sh_coefficients_rest,
-                densification_info=torch.empty(0, device=device),
-                rasterizer_settings=extract_settings(view, gaussians.active_sh_bases, view.camera.background_color, self.PROPER_ANTIALIASING),
-                virtual_scale=1.0,
-                tau=tau,
-            )
+            eta_soft = torch.ones((), dtype=gaussians.means.dtype, device=device)
+            eta_hard = eta_soft
+
+        return image, {
+            'eta_actual': eta_soft,
+            'eta_actual_hard': eta_hard,
+            'virtual_scale': virtual_scale,
+        }
+
+    @torch.no_grad()
+    def render_image_inference(self, view: View, to_chw: bool = False) -> dict[str, torch.Tensor]:
+        gaussians = self.model.gaussians
+
+        image = rasterize(
+            means=gaussians.means,
+            scales=gaussians.raw_scales + math.log(max(self.SCALE_MODIFIER, 1e-6)),
+            rotations=gaussians.raw_rotations,
+            opacities=gaussians.raw_opacities,
+            distance_decay=gaussians.raw_distance_decay,
+            sh_coefficients_0=gaussians.sh_coefficients_0,
+            sh_coefficients_rest=gaussians.sh_coefficients_rest,
+            rasterizer_settings=extract_settings(
+                view,
+                gaussians.active_sh_bases,
+                view.camera.background_color,
+                self.PROPER_ANTIALIASING,
+            ),
+            to_chw=True,
+            virtual_scale=self.CLOD_VIRTUAL_SCALE,
+            tau=self.CLOD_TAU,
+        )
 
         image = image.clamp(0.0, 1.0)
         return {'rgb': image if to_chw else image.permute(1, 2, 0)}
 
     @torch.inference_mode()
     def render_image_benchmark(self, view: View, to_chw: bool = False) -> dict[str, torch.Tensor]:
-        """Renders an image for a given view."""
         image = rasterize(
             means=self.model.gaussians.means,
             scales=self.model.gaussians.raw_scales,
@@ -220,30 +184,44 @@ class FasterGSRenderer(BaseRenderer):
             distance_decay=self.model.gaussians.raw_distance_decay,
             sh_coefficients_0=self.model.gaussians.sh_coefficients_0,
             sh_coefficients_rest=self.model.gaussians.sh_coefficients_rest,
-            rasterizer_settings=extract_settings(view, self.model.gaussians.active_sh_bases, view.camera.background_color, self.PROPER_ANTIALIASING),
-            to_chw=to_chw,
+            rasterizer_settings=extract_settings(
+                view,
+                self.model.gaussians.active_sh_bases,
+                view.camera.background_color,
+                self.PROPER_ANTIALIASING,
+            ),
+            to_chw=True,
             virtual_scale=self.CLOD_VIRTUAL_SCALE,
             tau=self.CLOD_TAU,
         )
-        return {'rgb': image}
 
-    @torch.inference_mode()
+        image = image.clamp(0.0, 1.0)
+        return {'rgb': image if to_chw else image.permute(1, 2, 0)}
+
+    @torch.no_grad()
     def compute_pruning_scores(self, dataset: BaseDataset) -> torch.Tensor:
-        """Computes the pruning scores for the current dataset."""
-        scores = torch.zeros(self.model.gaussians.means.shape[0], device=self.model.gaussians.means.device, dtype=torch.float32)
+        gaussians = self.model.gaussians
+        scores = torch.zeros(
+            (gaussians.n_primitives, 1),
+            dtype=gaussians.means.dtype,
+            device=gaussians.means.device,
+        )
+
         for view in dataset:
             update_pruning_scores(
                 scores=scores,
-                means=self.model.gaussians.means,
-                scales=self.model.gaussians.raw_scales,
-                rotations=self.model.gaussians.raw_rotations,
-                opacities=self.model.gaussians.raw_opacities,
-                sh_coefficients_0=self.model.gaussians.sh_coefficients_0,
-                sh_coefficients_rest=self.model.gaussians.sh_coefficients_rest,
-                rasterizer_settings=extract_settings(view, self.model.gaussians.active_sh_bases, view.camera.background_color, self.PROPER_ANTIALIASING),
+                means=gaussians.means,
+                scales=gaussians.raw_scales,
+                rotations=gaussians.raw_rotations,
+                opacities=gaussians.raw_opacities,
+                sh_coefficients_0=gaussians.sh_coefficients_0,
+                sh_coefficients_rest=gaussians.sh_coefficients_rest,
+                rasterizer_settings=extract_settings(
+                    view,
+                    gaussians.active_sh_bases,
+                    view.camera.background_color,
+                    self.PROPER_ANTIALIASING,
+                ),
             )
-        return scores
 
-    def postprocess_outputs(self, outputs: dict[str, torch.Tensor], *_) -> dict[str, torch.Tensor]:
-        """Postprocesses the model outputs, returning tensors of shape 3xHxW."""
-        return {'rgb': outputs['rgb']}
+        return scores

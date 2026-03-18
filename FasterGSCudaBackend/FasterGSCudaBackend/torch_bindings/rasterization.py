@@ -1,4 +1,4 @@
-from typing import NamedTuple, Any
+from typing import Any, NamedTuple
 import torch
 from torch.autograd.function import once_differentiable
 
@@ -6,19 +6,19 @@ from FasterGSCudaBackend import _C
 
 
 class RasterizerSettings(NamedTuple):
-    w2c: torch.Tensor  # affine transformation from model/world space to view space
-    cam_position: torch.Tensor  # camera position in world space
-    bg_color: torch.Tensor  # background color in RGB format
-    active_sh_bases: int  # number of spherical harmonics bases to use for color computation
-    width: int  # width of the image plane in pixels
-    height: int  # height of the image plane in pixels
-    focal_x: float  # focal length in x direction in pixels
-    focal_y: float  # focal length in y direction in pixels
-    center_x: float  # x coordinate of the image center in pixels (positive -> right)
-    center_y: float  # y coordinate of the image center in pixels (positive -> down)
-    near_plane: float  # near clipping plane distance
-    far_plane: float  # far clipping plane distance
-    proper_antialiasing: bool  # whether to use proper antialiasing
+    w2c: torch.Tensor
+    cam_position: torch.Tensor
+    bg_color: torch.Tensor
+    active_sh_bases: int
+    width: int
+    height: int
+    focal_x: float
+    focal_y: float
+    center_x: float
+    center_y: float
+    near_plane: float
+    far_plane: float
+    proper_antialiasing: bool
 
     def as_tuple(self) -> tuple:
         return (
@@ -56,8 +56,13 @@ class _Rasterize(torch.autograd.Function):
     ) -> torch.Tensor:
         (
             image,
-            primitive_buffers, tile_buffers, instance_buffers, bucket_buffers,
-            n_instances, n_buckets, instance_primitive_indices_selector
+            primitive_buffers,
+            tile_buffers,
+            instance_buffers,
+            bucket_buffers,
+            n_instances,
+            n_buckets,
+            instance_primitive_indices_selector,
         ) = _C.forward(
             means,
             scales,
@@ -70,22 +75,27 @@ class _Rasterize(torch.autograd.Function):
             virtual_scale,
             tau,
         )
+
         ctx.rasterizer_settings = rasterizer_settings
         ctx.buffer_state = (n_instances, n_buckets, instance_primitive_indices_selector)
+        ctx.virtual_scale = float(virtual_scale)
+        ctx.tau = float(tau)
+        ctx.densification_info = densification_info
+        ctx.mark_non_differentiable(densification_info)
+
         ctx.save_for_backward(
             image,
             means,
             scales,
             rotations,
             opacities,
+            distance_decay,
             sh_coefficients_rest,
             primitive_buffers,
             tile_buffers,
             instance_buffers,
             bucket_buffers,
         )
-        ctx.densification_info = densification_info
-        ctx.mark_non_differentiable(densification_info)
         return image
 
     @staticmethod
@@ -95,27 +105,59 @@ class _Rasterize(torch.autograd.Function):
         grad_image: torch.Tensor,
     ):
         (
-            grad_means, grad_scales, grad_rotations, grad_opacities,
-            grad_sh_coefficients_0, grad_sh_coefficients_rest
+            image,
+            means,
+            scales,
+            rotations,
+            opacities,
+            distance_decay,
+            sh_coefficients_rest,
+            primitive_buffers,
+            tile_buffers,
+            instance_buffers,
+            bucket_buffers,
+        ) = ctx.saved_tensors
+
+        (
+            grad_means,
+            grad_scales,
+            grad_rotations,
+            grad_opacities,
+            grad_distance_decay,
+            grad_sh_coefficients_0,
+            grad_sh_coefficients_rest,
         ) = _C.backward(
             ctx.densification_info,
             grad_image,
-            *ctx.saved_tensors,
+            image,
+            means,
+            scales,
+            rotations,
+            opacities,
+            distance_decay,
+            sh_coefficients_rest,
+            primitive_buffers,
+            tile_buffers,
+            instance_buffers,
+            bucket_buffers,
             *ctx.rasterizer_settings.as_tuple(),
+            ctx.virtual_scale,
+            ctx.tau,
             *ctx.buffer_state,
         )
+
         return (
-            grad_means,                # means
-            grad_scales,               # scales
-            grad_rotations,            # rotations
-            grad_opacities,            # opacities
-            None,                      # distance_decay
-            grad_sh_coefficients_0,    # sh_coefficients_0
-            grad_sh_coefficients_rest, # sh_coefficients_rest
-            None,                      # densification_info
-            None,                      # rasterizer_settings
-            None,                      # virtual_scale
-            None,                      # tau
+            grad_means,                 # means
+            grad_scales,                # scales
+            grad_rotations,             # rotations
+            grad_opacities,             # opacities
+            grad_distance_decay,        # distance_decay
+            grad_sh_coefficients_0,     # sh_coefficients_0
+            grad_sh_coefficients_rest,  # sh_coefficients_rest
+            None,                       # densification_info
+            None,                       # rasterizer_settings
+            None,                       # virtual_scale
+            None,                       # tau
         )
 
 
@@ -152,20 +194,26 @@ def rasterize(
     scales: torch.Tensor,
     rotations: torch.Tensor,
     opacities: torch.Tensor,
+    distance_decay: torch.Tensor,
     sh_coefficients_0: torch.Tensor,
     sh_coefficients_rest: torch.Tensor,
     rasterizer_settings: RasterizerSettings,
     to_chw: bool,
+    virtual_scale: float,
+    tau: float,
 ) -> torch.Tensor:
     return _C.inference(
         means,
         scales,
         rotations,
         opacities,
+        distance_decay,
         sh_coefficients_0,
         sh_coefficients_rest,
         *rasterizer_settings.as_tuple(),
         to_chw,
+        virtual_scale,
+        tau,
     )
 
 

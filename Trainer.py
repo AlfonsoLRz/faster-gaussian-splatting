@@ -51,18 +51,18 @@ from Optim.Samplers.DatasetSamplers import DatasetSampler
     ),
     CLOD=Framework.ConfigParameterList(
         USE=True,
-        START_ITERATION=5_500,
-        VIRTUAL_SCALE_MIN=2.0,
-        VIRTUAL_SCALE_MAX=7.0,
+        START_ITERATION=8000,
+        VIRTUAL_SCALE_MIN=1.0,
+        VIRTUAL_SCALE_MAX=2.0,
         TAU=1e-2,
-        LAMBDA_REG=1.0,
+        LAMBDA_REG=0.05,
         ETA_EXPONENT=1.5,
     ),
     LOSS=Framework.ConfigParameterList(
         LAMBDA_L1=0.8,
         LAMBDA_DSSIM=0.2,
         LAMBDA_OPACITY_REGULARIZATION=0.0,
-        LAMBDA_SCALE_REGULARIZATION=0.0,
+        LAMBDA_SCALE_REGULARIZATION=0.001,
     ),
     OPTIMIZER=Framework.ConfigParameterList(
         LEARNING_RATE_MEANS_INIT=0.00016,
@@ -73,7 +73,7 @@ from Optim.Samplers.DatasetSamplers import DatasetSampler
         LEARNING_RATE_OPACITIES=0.025,
         LEARNING_RATE_SCALES=0.005,
         LEARNING_RATE_ROTATIONS=0.001,
-        LEARNING_RATE_DISTANCE_DECAY=0.001,
+        LEARNING_RATE_DISTANCE_DECAY=0.01,
     ),
 )
 class FasterGSTrainer(GuiTrainer):
@@ -289,7 +289,9 @@ class FasterGSTrainer(GuiTrainer):
                 f'etat={eta_target:.4f} '
                 f'lreg={l_reg.item():.6f} '
                 f'raw_decay_mean={self.model.gaussians.raw_distance_decay.mean().item():.6f} '
-                f'decay_mean={torch.relu(self.model.gaussians.raw_distance_decay).mean().item():.6f}'
+                f'decay_mean={torch.relu(self.model.gaussians.raw_distance_decay).mean().item():.6f} '
+                f'scale_mean={self.model.gaussians.raw_scales.exp().mean().item():.6f} '
+                f'scale_max={self.model.gaussians.raw_scales.exp().max().item():.6f}'
             )
 
         loss.backward()

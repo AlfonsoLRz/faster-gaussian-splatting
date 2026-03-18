@@ -12,6 +12,7 @@ namespace faster_gs::rasterization {
         const float3* scales,
         const float4* rotations,
         const float* opacities,
+        const float* distance_decay,
         const float3* sh_coefficients_rest,
         const float4* w2c,
         const float3* cam_position,
@@ -24,6 +25,7 @@ namespace faster_gs::rasterization {
         float3* grad_scales,
         float4* grad_rotations,
         float* grad_opacities,
+        float* grad_distance_decay,
         float3* grad_sh_coefficients_0,
         float3* grad_sh_coefficients_rest,
         float2* grad_mean2d_helper,
@@ -41,6 +43,8 @@ namespace faster_gs::rasterization {
         const float focal_y,
         const float center_x,
         const float center_y,
-        const bool proper_antialiasing);
+        const bool proper_antialiasing,
+        const float virtual_scale,
+        const float tau);
 
 }
