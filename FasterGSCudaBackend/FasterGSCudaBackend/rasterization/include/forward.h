@@ -23,6 +23,7 @@ namespace faster_gs::rasterization {
         const float3* cam_position,
         const float3* bg_color,
         float* image,
+        float* primitive_distances,
         const int n_primitives,
         const int active_sh_bases,
         const int total_sh_bases,

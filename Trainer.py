@@ -16,7 +16,7 @@ from Optim.Samplers.DatasetSamplers import DatasetSampler
 @Framework.Configurable.configure(
     NUM_ITERATIONS=30_000,
     DENSIFICATION_START_ITERATION=600,
-    DENSIFICATION_END_ITERATION=14_900,
+    DENSIFICATION_END_ITERATION=5_000,
     #DENSIFICATION_END_ITERATION=2_000,
     DENSIFICATION_INTERVAL=100,
     DENSIFICATION_GRAD_THRESHOLD=0.0002,
@@ -51,7 +51,7 @@ from Optim.Samplers.DatasetSamplers import DatasetSampler
     ),
     CLOD=Framework.ConfigParameterList(
         USE=True,
-        START_ITERATION=15_500,
+        START_ITERATION=5_500,
         VIRTUAL_SCALE_MIN=2.0,
         VIRTUAL_SCALE_MAX=7.0,
         TAU=1e-2,
@@ -257,6 +257,7 @@ class FasterGSTrainer(GuiTrainer):
             image = render_output
             lod_meta = {
                 'eta_actual': torch.ones((), dtype=image.dtype, device=image.device),
+                'eta_actual_hard': torch.ones((), dtype=image.dtype, device=image.device),
                 'virtual_scale': 1.0,
             }
 
@@ -273,6 +274,8 @@ class FasterGSTrainer(GuiTrainer):
             w_s = self.clod_weight(virtual_scale)
             loss = w_s * (render_loss + self.CLOD.LAMBDA_REG * l_reg)
         else:
+            eta_actual = torch.ones((), dtype=render_loss.dtype, device=render_loss.device)
+            eta_actual_hard = eta_actual
             l_reg = torch.zeros((), dtype=render_loss.dtype, device=render_loss.device)
             loss = render_loss
 
@@ -282,6 +285,7 @@ class FasterGSTrainer(GuiTrainer):
                 f'iter={iteration} '
                 f'vs={virtual_scale:.3f} '
                 f'eta={eta_actual.item():.4f} '
+                f'eta_hard={eta_actual_hard.item():.4f} '
                 f'etat={eta_target:.4f} '
                 f'lreg={l_reg.item():.6f} '
                 f'raw_decay_mean={self.model.gaussians.raw_distance_decay.mean().item():.6f} '

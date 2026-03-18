@@ -51,8 +51,8 @@ class _Rasterize(torch.autograd.Function):
         sh_coefficients_rest: torch.Tensor,
         densification_info: torch.Tensor,
         rasterizer_settings: RasterizerSettings,
-        virtual_scale: float = 1.0,
-        tau: float = 1e-3,
+        virtual_scale: float,
+        tau: float,
     ) -> torch.Tensor:
         (
             image,
@@ -93,7 +93,7 @@ class _Rasterize(torch.autograd.Function):
     def backward(
         ctx: Any,
         grad_image: torch.Tensor,
-    ) -> 'tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, None, torch.Tensor, torch.Tensor, None, None, None, None]':
+    ):
         (
             grad_means, grad_scales, grad_rotations, grad_opacities,
             grad_sh_coefficients_0, grad_sh_coefficients_rest
@@ -105,17 +105,17 @@ class _Rasterize(torch.autograd.Function):
             *ctx.buffer_state,
         )
         return (
-            grad_means,
-            grad_scales,
-            grad_rotations,
-            grad_opacities,
-            None,  # distance_decay
-            grad_sh_coefficients_0,
-            grad_sh_coefficients_rest,
-            None,  # densification_info
-            None,  # rasterizer_settings
-            None,  # virtual_scale
-            None,  # tau
+            grad_means,                # means
+            grad_scales,               # scales
+            grad_rotations,            # rotations
+            grad_opacities,            # opacities
+            None,                      # distance_decay
+            grad_sh_coefficients_0,    # sh_coefficients_0
+            grad_sh_coefficients_rest, # sh_coefficients_rest
+            None,                      # densification_info
+            None,                      # rasterizer_settings
+            None,                      # virtual_scale
+            None,                      # tau
         )
 
 
@@ -129,8 +129,8 @@ def diff_rasterize(
     sh_coefficients_rest: torch.Tensor,
     densification_info: torch.Tensor,
     rasterizer_settings: RasterizerSettings,
-    virtual_scale: float = 1.0,
-    tau: float = 1e-3,
+    virtual_scale: float,
+    tau: float,
 ) -> torch.Tensor:
     return _Rasterize.apply(
         means,
@@ -152,25 +152,19 @@ def rasterize(
     scales: torch.Tensor,
     rotations: torch.Tensor,
     opacities: torch.Tensor,
-    distance_decay: torch.Tensor,
     sh_coefficients_0: torch.Tensor,
     sh_coefficients_rest: torch.Tensor,
     rasterizer_settings: RasterizerSettings,
     to_chw: bool,
-    virtual_scale: float = 1.0,
-    tau: float = 1e-3,
 ) -> torch.Tensor:
     return _C.inference(
         means,
         scales,
         rotations,
         opacities,
-        distance_decay,
         sh_coefficients_0,
         sh_coefficients_rest,
         *rasterizer_settings.as_tuple(),
-        virtual_scale,
-        tau,
         to_chw,
     )
 

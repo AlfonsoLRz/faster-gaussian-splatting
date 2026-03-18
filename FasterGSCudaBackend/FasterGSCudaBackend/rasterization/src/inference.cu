@@ -23,6 +23,7 @@ void faster_gs::rasterization::inference(
     const float3* cam_position,
     const float3* bg_color,
     float* image,
+    float* primitive_distances,
     const int n_primitives,
     const int active_sh_bases,
     const int total_sh_bases,
@@ -67,18 +68,14 @@ void faster_gs::rasterization::inference(
     cudaMemset(primitive_buffers.n_instances, 0, sizeof(uint));
 
     // CLoD distance prepass
-    float* primitive_distances = nullptr;
+    //float* primitive_distances = nullptr;
     float* max_distance_gpu = nullptr;
     void* reduce_workspace = nullptr;
     size_t reduce_workspace_size = 0;
 
-    cudaMalloc(&primitive_distances, sizeof(float) * static_cast<size_t>(n_primitives));
-    cudaMalloc(&max_distance_gpu, sizeof(float))
-;
-    kernels::inference::compute_distances_cu<<<
-        div_round_up(n_primitives, config::block_size_preprocess),
-        config::block_size_preprocess
-    >>>(
+    cudaMalloc(&max_distance_gpu, sizeof(float));
+
+    kernels::inference::compute_distances_cu<<<div_round_up(n_primitives, config::block_size_preprocess), config::block_size_preprocess>>>(
         means,
         cam_position,
         primitive_distances,
@@ -107,9 +104,7 @@ void faster_gs::rasterization::inference(
     float max_distance = 1.0f;
     cudaMemcpy(&max_distance, max_distance_gpu, sizeof(float), cudaMemcpyDeviceToHost);
 
-    // -------------------------------------------------------------------------
     // Main preprocess
-    // -------------------------------------------------------------------------
     kernels::inference::preprocess_cu<<<div_round_up(n_primitives, config::block_size_preprocess), config::block_size_preprocess>>>(
         means,
         scales,
@@ -153,7 +148,6 @@ void faster_gs::rasterization::inference(
     // Distance prepass buffers no longer needed
     cudaFree(reduce_workspace);
     cudaFree(max_distance_gpu);
-    cudaFree(primitive_distances);
 
     int n_visible_primitives;
     cudaMemcpy(&n_visible_primitives, primitive_buffers.n_visible_primitives, sizeof(uint), cudaMemcpyDeviceToHost);

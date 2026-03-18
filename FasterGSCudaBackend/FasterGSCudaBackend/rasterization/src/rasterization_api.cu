@@ -53,6 +53,7 @@ faster_gs::rasterization::forward_wrapper(
     torch::Tensor tile_buffers = torch::empty({0}, byte_options);
     torch::Tensor instance_buffers = torch::empty({0}, byte_options);
     torch::Tensor bucket_buffers = torch::empty({0}, byte_options);
+    torch::Tensor max_distance_buffer = torch::empty({n_primitives}, float_options);
 
     const std::function<char*(size_t)> resize_primitive_buffers = resize_function_wrapper(primitive_buffers);
     const std::function<char*(size_t)> resize_tile_buffers = resize_function_wrapper(tile_buffers);
@@ -75,6 +76,7 @@ faster_gs::rasterization::forward_wrapper(
         reinterpret_cast<float3*>(cam_position.contiguous().data_ptr<float>()),
         reinterpret_cast<float3*>(bg_color.contiguous().data_ptr<float>()),
         image.data_ptr<float>(),
+        max_distance_buffer.data_ptr<float>(),
         n_primitives,
         active_sh_bases,
         total_sh_bases,
@@ -228,6 +230,7 @@ faster_gs::rasterization::inference_wrapper(
     torch::Tensor primitive_buffers = torch::empty({0}, byte_options);
     torch::Tensor tile_buffers = torch::empty({0}, byte_options);
     torch::Tensor instance_buffers = torch::empty({0}, byte_options);
+    torch::Tensor max_distance_buffer = torch::empty({n_primitives}, float_options);
 
     const std::function<char*(size_t)> resize_primitive_buffers = resize_function_wrapper(primitive_buffers);
     const std::function<char*(size_t)> resize_tile_buffers = resize_function_wrapper(tile_buffers);
@@ -248,6 +251,7 @@ faster_gs::rasterization::inference_wrapper(
         reinterpret_cast<float3*>(cam_position.contiguous().data_ptr<float>()),
         reinterpret_cast<float3*>(bg_color.contiguous().data_ptr<float>()),
         image.data_ptr<float>(),
+        max_distance_buffer.data_ptr<float>(),
         n_primitives,
         active_sh_bases,
         total_sh_bases,

@@ -51,7 +51,7 @@ def compute_clod_opacity_and_mask(
     tau: float,
     eps: float = 1e-8,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Computes CLoD-adjusted opacities and a binary mask."""
+    """Computes CLoD opacities, hard mask, and hard eta_actual."""
     if means.shape[0] == 0:
         empty_mask = torch.zeros((0,), dtype=torch.bool, device=means.device)
         empty_opacities = raw_opacities
@@ -65,38 +65,13 @@ def compute_clod_opacity_and_mask(
     alpha = raw_opacities.sigmoid()
 
     alpha_lod = alpha * torch.exp(-((d_norm * virtual_scale) ** 2) / (2.0 * sigma.square() + eps))
-    mask = (alpha_lod > (tau * virtual_scale)).squeeze(-1)
+    threshold = tau * virtual_scale
+    mask = (alpha_lod > threshold).squeeze(-1)
 
     raw_opacities_lod = alpha_lod.clamp(1e-6, 1.0 - 1e-6).logit()
     eta_actual = mask.float().mean()
 
     return raw_opacities_lod, mask, eta_actual
-
-
-def compute_clod_soft_eta(
-    means: torch.Tensor,
-    raw_opacities: torch.Tensor,
-    raw_distance_decay: torch.Tensor,
-    camera_position: torch.Tensor,
-    virtual_scale: float,
-    tau: float,
-    soft_k: float = 50.0,
-    eps: float = 1e-8,
-) -> torch.Tensor:
-    """Differentiable surrogate of eta_actual for CLoD regularization."""
-    if means.shape[0] == 0:
-        return torch.zeros((), dtype=raw_opacities.dtype, device=raw_opacities.device)
-
-    d = torch.linalg.norm(means - camera_position[None, :], dim=1, keepdim=True)
-    d_norm = d / d.max().clamp_min(eps)
-
-    sigma = torch.relu(raw_distance_decay)
-    alpha = raw_opacities.sigmoid()
-    alpha_lod = alpha * torch.exp(-((d_norm * virtual_scale) ** 2) / (2.0 * sigma.square() + eps))
-
-    threshold = tau * virtual_scale
-    soft_keep = torch.sigmoid(soft_k * (alpha_lod - threshold))
-    return soft_keep.mean()
 
 
 @Framework.Configurable.configure(
@@ -141,16 +116,7 @@ class FasterGSRenderer(BaseRenderer):
         effective_use_clod = use_clod and (not update_densification_info)
 
         if effective_use_clod:
-            _, _, eta_actual_hard = compute_clod_opacity_and_mask(
-                means=gaussians.means,
-                raw_opacities=gaussians.raw_opacities,
-                raw_distance_decay=gaussians.raw_distance_decay,
-                camera_position=view.position,
-                virtual_scale=virtual_scale,
-                tau=tau,
-            )
-
-            eta_actual = compute_clod_soft_eta(
+            _, _, eta_actual = compute_clod_opacity_and_mask(
                 means=gaussians.means,
                 raw_opacities=gaussians.raw_opacities,
                 raw_distance_decay=gaussians.raw_distance_decay,
@@ -160,9 +126,8 @@ class FasterGSRenderer(BaseRenderer):
             )
         else:
             eta_actual = torch.ones((), dtype=gaussians.means.dtype, device=device)
-            eta_actual_hard = torch.ones((), dtype=gaussians.means.dtype, device=device)
 
-        # Always render the full Gaussian set during training.
+        # Keep training render stable: always render full Gaussian set.
         image = diff_rasterize(
             means=gaussians.means,
             scales=gaussians.raw_scales,
@@ -179,7 +144,7 @@ class FasterGSRenderer(BaseRenderer):
 
         return image, {
             'eta_actual': eta_actual,
-            'eta_actual_hard': eta_actual_hard,
+            'eta_actual_hard': eta_actual,
             'virtual_scale': virtual_scale,
         }
 
