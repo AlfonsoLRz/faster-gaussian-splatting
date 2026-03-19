@@ -60,12 +60,12 @@ def compute_clod_soft_and_hard_eta(
         return zero, zero
 
     d = torch.linalg.norm(means - camera_position[None, :], dim=1, keepdim=True)
-    d_norm = d / d.max().clamp_min(eps)
 
     sigma = torch.relu(raw_distance_decay)
     alpha = raw_opacities.sigmoid()
 
-    alpha_lod = alpha * torch.exp(-((d_norm * virtual_scale) ** 2) / (2.0 * sigma.square() + eps))
+    denom = (d * virtual_scale).square() + eps
+    alpha_lod = alpha * torch.exp(-(2.0 * sigma.square() + eps) / denom)
     threshold = tau * virtual_scale
 
     hard_mask = (alpha_lod > threshold).float()
