@@ -144,7 +144,6 @@ namespace faster_gs::rasterization::kernels::backward {
 
             float sigma = 0.0f;
             float distance = 0.0f;
-            float distance_norm = 0.0f;
             float denom_clod = 1.0f;
             float decay_clod = 1.0f;
             float alpha_after_clod = alpha_base;
@@ -157,12 +156,11 @@ namespace faster_gs::rasterization::kernels::backward {
                     mean3d.z - cam.z
                 );
                 distance = length(delta_cam);
-                distance_norm = distance / fmaxf(max_distance, 1e-8f);
 
                 sigma = fmaxf(distance_decay[primitive_idx], 0.0f);
-                denom_clod = 2.0f * sigma * sigma + 1e-8f;
-                const float x_clod = distance_norm * virtual_scale;
-                decay_clod = __expf(-(x_clod * x_clod) / denom_clod);
+                denom_clod = distance * distance * virtual_scale * virtual_scale + 1e-8f;
+                const float numer_clod = 2.0f * sigma * sigma + 1e-8f;
+                decay_clod = __expf(-numer_clod / denom_clod);
                 alpha_after_clod = alpha_base * decay_clod;
             }
 
@@ -196,17 +194,17 @@ namespace faster_gs::rasterization::kernels::backward {
                 dL_draw_opacity = dL_dalpha_after_clod * decay_clod * alpha_base * (1.0f - alpha_base);
 
                 if (distance_decay[primitive_idx] > 0.0f) {
-                    const float A = (distance_norm * virtual_scale) * (distance_norm * virtual_scale);
                     const float d_alpha_d_sigma =
-                        alpha_base * decay_clod * (2.0f * A * sigma) / (denom_clod * denom_clod);
+                        -alpha_base * decay_clod * (4.0f * sigma) / denom_clod;
                     grad_distance_decay[primitive_idx] = dL_dalpha_after_clod * d_alpha_d_sigma;
                 }
 
                 if (distance > 1e-8f) {
+                    const float numer_clod = 2.0f * sigma * sigma + 1e-8f;
                     const float d_alpha_d_distance =
                         alpha_base * decay_clod *
-                        (-2.0f * distance * virtual_scale * virtual_scale) /
-                        (fmaxf(max_distance * max_distance, 1e-8f) * denom_clod);
+                        (2.0f * numer_clod * distance * virtual_scale * virtual_scale) /
+                        (denom_clod * denom_clod);
 
                     const float3 cam = cam_position[0];
                     const float3 delta_cam = make_float3(

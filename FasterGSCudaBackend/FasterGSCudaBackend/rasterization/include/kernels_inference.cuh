@@ -39,7 +39,7 @@ namespace faster_gs::rasterization::kernels::inference {
         const float4* __restrict__ w2c,
         const float3* __restrict__ cam_position,
         const float* __restrict__ primitive_distances,
-        const float max_distance,
+        const float /*max_distance*/,
         uint* __restrict__ primitive_depth_keys,
         uint* __restrict__ primitive_indices,
         uint* __restrict__ primitive_n_touched_tiles,
@@ -97,12 +97,9 @@ namespace faster_gs::rasterization::kernels::inference {
         // CLoD hard mask in inference preprocess
         if (active && virtual_scale > 1.0f) {
             const float distance = primitive_distances[primitive_idx];
-            const float distance_norm = distance / fmaxf(max_distance, 1e-8f);
-
             const float sigma = fmaxf(distance_decay[primitive_idx], 0.0f);
-            const float denom = 2.0f * sigma * sigma + 1e-8f;
-            const float x_clod = distance_norm * virtual_scale;
-            const float alpha_lod = opacity * __expf(-(x_clod * x_clod) / denom);
+            const float denom = distance * distance * virtual_scale * virtual_scale + 1e-8f;
+            const float alpha_lod = opacity * __expf(-(2.0f * sigma * sigma + 1e-8f) / denom);
 
             if (alpha_lod <= tau * virtual_scale) active = false;
             opacity = alpha_lod;
