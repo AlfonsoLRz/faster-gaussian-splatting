@@ -42,8 +42,7 @@ namespace faster_gs::rasterization::kernels::backward {
         const float center_x,
         const float center_y,
         const bool proper_antialiasing,
-        const float virtual_scale,
-        const float max_distance)
+        const float virtual_scale)
     {
         const uint primitive_idx = blockIdx.x * blockDim.x + threadIdx.x;
         if (primitive_idx >= n_primitives || primitive_n_touched_tiles[primitive_idx] == 0) return;

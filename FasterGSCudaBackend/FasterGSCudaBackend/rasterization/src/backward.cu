@@ -4,15 +4,6 @@
 #include "rasterization_config.h"
 #include "utils.h"
 #include "helper_math.h"
-#include <cub/cub.cuh>
-
-namespace faster_gs::rasterization::kernels::forward {
-    __global__ void compute_distances_cu(
-        const float3* __restrict__ means,
-        const float3* __restrict__ cam_position,
-        float* __restrict__ primitive_distances,
-        const uint n_primitives);
-}
 
 void faster_gs::rasterization::backward(
     const float* grad_image,
@@ -108,49 +99,6 @@ void faster_gs::rasterization::backward(
         dispatch_rasterize_backward(instance_buffers.primitive_indices.Current());
     }
 
-    float max_distance = 1.0f;
-    if (virtual_scale > 1.0f && n_primitives > 0) {
-        float* primitive_distances = nullptr;
-        float* max_distance_gpu = nullptr;
-        void* reduce_workspace = nullptr;
-        size_t reduce_workspace_size = 0;
-
-        cudaMalloc(&primitive_distances, sizeof(float) * n_primitives);
-        cudaMalloc(&max_distance_gpu, sizeof(float));
-
-        kernels::forward::compute_distances_cu<<<div_round_up(n_primitives, config::block_size_preprocess), config::block_size_preprocess>>>(
-            means,
-            cam_position,
-            primitive_distances,
-            n_primitives
-        );
-        CHECK_CUDA(config::debug, "compute_distances_backward")
-
-        cub::DeviceReduce::Max(
-            reduce_workspace,
-            reduce_workspace_size,
-            primitive_distances,
-            max_distance_gpu,
-            n_primitives
-        );
-        cudaMalloc(&reduce_workspace, reduce_workspace_size);
-
-        cub::DeviceReduce::Max(
-            reduce_workspace,
-            reduce_workspace_size,
-            primitive_distances,
-            max_distance_gpu,
-            n_primitives
-        );
-        CHECK_CUDA(config::debug, "cub::DeviceReduce::Max (max_distance_backward)")
-
-        cudaMemcpy(&max_distance, max_distance_gpu, sizeof(float), cudaMemcpyDeviceToHost);
-
-        cudaFree(reduce_workspace);
-        cudaFree(max_distance_gpu);
-        cudaFree(primitive_distances);
-    }
-
     kernels::backward::preprocess_backward_cu<<<
         div_round_up(n_primitives, config::block_size_preprocess_backward),
         config::block_size_preprocess_backward
@@ -184,8 +132,7 @@ void faster_gs::rasterization::backward(
         center_x,
         center_y,
         proper_antialiasing,
-        virtual_scale,
-        max_distance
+        virtual_scale
     );
     CHECK_CUDA(config::debug, "preprocess_backward")
 }

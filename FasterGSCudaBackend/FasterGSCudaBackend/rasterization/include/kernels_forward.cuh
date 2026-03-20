@@ -39,7 +39,6 @@ namespace faster_gs::rasterization::kernels::forward {
         const float4* __restrict__ w2c,
         const float3* __restrict__ cam_position,
         const float* __restrict__ primitive_distances,
-        const float /*max_distance*/,
         uint* __restrict__ primitive_depth_keys,
         uint* __restrict__ primitive_indices,
         uint* __restrict__ primitive_n_touched_tiles,

@@ -120,6 +120,15 @@ and interactive rendering via `gui.py`.
 
 For detailed instructions, please refer to the [NeRFICG repository](https://github.com/nerficg-project/nerficg).
 
+### CLoD / virtual scale settings
+
+FasterGS exposes two renderer configuration values for the CLoD virtual distance scale:
+
+- `RENDERER.CLOD_VIRTUAL_SCALE`: the default runtime virtual scale used during inference.
+- `RENDERER.GUI_VIRTUAL_SCALE`: an optional GUI override. If this value is set to something larger than `0.0`, the renderer uses it instead of `CLOD_VIRTUAL_SCALE`.
+
+This repository only contains the FasterGS method integration and renderer hook. The actual GUI widgets live in the main NeRFICG repository, so you will not see a new slider or input field here unless the NeRFICG GUI code is updated to write `RENDERER.GUI_VIRTUAL_SCALE`.
+
 
 ## Acknowledgements
 
