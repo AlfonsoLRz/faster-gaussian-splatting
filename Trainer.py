@@ -1,6 +1,7 @@
 """FasterGS/Trainer.py"""
 
 import torch
+import pickle
 
 import Framework
 from Datasets.Base import BaseDataset
@@ -17,7 +18,6 @@ from Optim.Samplers.DatasetSamplers import DatasetSampler
     NUM_ITERATIONS=30_000,
     DENSIFICATION_START_ITERATION=600,
     DENSIFICATION_END_ITERATION=5_000,
-    #DENSIFICATION_END_ITERATION=2_000,
     DENSIFICATION_INTERVAL=100,
     DENSIFICATION_GRAD_THRESHOLD=0.0002,
     DENSIFICATION_PERCENT_DENSE=0.01,
@@ -51,9 +51,9 @@ from Optim.Samplers.DatasetSamplers import DatasetSampler
     ),
     CLOD=Framework.ConfigParameterList(
         USE=True,
-        START_ITERATION=8000,
+        START_ITERATION=8_000,
         VIRTUAL_SCALE_MIN=1.0,
-        VIRTUAL_SCALE_MAX=2.0,
+        VIRTUAL_SCALE_MAX=10.0,
         TAU=1e-2,
         LAMBDA_REG=0.05,
         ETA_EXPONENT=1.5,
@@ -88,6 +88,27 @@ class FasterGSTrainer(GuiTrainer):
         super().__init__(**kwargs)
         self.train_sampler = None
         self.loss = FasterGSLoss(loss_config=self.LOSS, gaussians=self.model.gaussians)
+
+    def __getstate__(self) -> dict:
+        """Drop runtime-only attributes that cannot be pickled into checkpoints."""
+        state = self.__dict__.copy()
+        excluded_attributes = []
+        for attribute_name, attribute_value in list(state.items()):
+            try:
+                pickle.dumps(attribute_value)
+            except Exception:  # runtime-only objects such as multiprocessing queues/processes
+                excluded_attributes.append(attribute_name)
+                state.pop(attribute_name)
+        if excluded_attributes:
+            Logger.log_warning(
+                'excluding non-serializable trainer attributes from checkpoint: ' + ', '.join(sorted(excluded_attributes))
+            )
+        return state
+
+    def __setstate__(self, state: dict) -> None:
+        """Restore checkpoint state and initialize dropped runtime-only attributes lazily."""
+        self.__dict__.update(state)
+        self.train_sampler = None
 
     def sample_virtual_scale(self, iteration: int) -> float:
         """Samples the virtual distance scale used by CLoD."""
@@ -345,4 +366,4 @@ class FasterGSTrainer(GuiTrainer):
             },
             final_model_path,
         )
-        Logger.log_info(f'saved final Gaussian model to {final_model_path}')
+        Logger.log_info(f'Saved final Gaussian model to {final_model_path}')
