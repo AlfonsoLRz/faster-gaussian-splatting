@@ -333,3 +333,16 @@ class FasterGSTrainer(GuiTrainer):
                 f'\n'
                 f'N_Gaussians:{n_gaussians}'
             )
+        final_model_path = self.output_directory / 'final_model.pt'
+        final_model_state = {
+            parameter_name: parameter_value.detach().cpu()
+            for parameter_name, parameter_value in self.model.state_dict().items()
+        }
+        torch.save(
+            {
+                'model_state_dict': final_model_state,
+                'num_iterations_trained': self.model.num_iterations_trained,
+            },
+            final_model_path,
+        )
+        Logger.log_info(f'saved final Gaussian model to {final_model_path}')
