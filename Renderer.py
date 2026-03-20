@@ -80,6 +80,7 @@ def compute_clod_soft_and_hard_eta(
     SCALE_MODIFIER=1.0,
     PROPER_ANTIALIASING=False,
     FORCE_OPTIMIZED_INFERENCE=False,
+    GUI_VIRTUAL_SCALE=0.0,
     CLOD_VIRTUAL_SCALE=1.0,
     CLOD_TAU=1e-2,
 )
@@ -92,6 +93,12 @@ class FasterGSRenderer(BaseRenderer):
             raise Framework.RendererError('FasterGS renderer not implemented in CPU mode')
         if len(Framework.config.GLOBAL.GPU_INDICES) > 1:
             Logger.log_warning(f'FasterGS renderer not implemented in multi-GPU mode: using GPU {Framework.config.GLOBAL.GPU_INDICES[0]}')
+
+    def get_virtual_scale(self) -> float:
+        """Returns the GUI-controlled virtual scale used for inference renders."""
+        if self.GUI_VIRTUAL_SCALE > 0.0:
+            return self.GUI_VIRTUAL_SCALE
+        return self.CLOD_VIRTUAL_SCALE
 
     def render_image(self, view: View, to_chw: bool = False, benchmark: bool = False) -> dict[str, torch.Tensor]:
         if benchmark or self.FORCE_OPTIMIZED_INFERENCE:
@@ -167,7 +174,7 @@ class FasterGSRenderer(BaseRenderer):
                 self.PROPER_ANTIALIASING,
             ),
             to_chw=True,
-            virtual_scale=self.CLOD_VIRTUAL_SCALE,
+            virtual_scale=self.get_virtual_scale(),
             tau=self.CLOD_TAU,
         )
 
@@ -191,7 +198,7 @@ class FasterGSRenderer(BaseRenderer):
                 self.PROPER_ANTIALIASING,
             ),
             to_chw=True,
-            virtual_scale=self.CLOD_VIRTUAL_SCALE,
+            virtual_scale=self.get_virtual_scale(),
             tau=self.CLOD_TAU,
         )
 
