@@ -324,12 +324,13 @@ class Gaussians(torch.nn.Module):
     def reset_densification_info(self) -> None:
         self._densification_info = torch.zeros((2, self._means.shape[0]), dtype=torch.float32, device='cuda')
 
-    def adaptive_density_control(self, grad_threshold: float, min_opacity: float, prune_large_gaussians: bool) -> None:
+    def adaptive_density_control(self, grad_threshold: float, min_opacity: float, prune_large_gaussians: bool, improved_gs_plus=None) -> None:
         """Densify Gaussians and prune those that are not visible or too large."""
         densification_mask = self.densification_info[1] >= grad_threshold * self.densification_info[0].clamp_min(1.0)
         is_small = torch.max(self._scales, dim=1).values <= math.log(self.percent_dense * self.training_cameras_extent)
 
-        duplicate_mask = densification_mask & is_small
+        use_split_only = improved_gs_plus is not None and improved_gs_plus.SPLIT_ONLY
+        duplicate_mask = torch.zeros_like(densification_mask) if use_split_only else densification_mask & is_small
         n_new_gaussians_duplicate = duplicate_mask.sum().item()
         duplicated_means = self._means[duplicate_mask]
         duplicated_sh_coefficients_0 = self._sh_coefficients_0[duplicate_mask]
@@ -339,17 +340,43 @@ class Gaussians(torch.nn.Module):
         duplicated_rotations = self._rotations[duplicate_mask]
         duplicated_distance_decay = self._distance_decay[duplicate_mask]
 
-        split_mask = densification_mask & ~is_small
+        split_mask = densification_mask if use_split_only else densification_mask & ~is_small
         n_new_gaussians_split = 2 * split_mask.sum().item()
-        split_scales = self._scales[split_mask].exp().expand(2, -1, -1).flatten(end_dim=1)
         split_rotations = self._rotations[split_mask].expand(2, -1, -1).flatten(end_dim=1)
-        offsets = (quaternion_to_rotation_matrix(split_rotations) @ (split_scales * torch.randn_like(split_scales))[..., None])[..., 0]
-        split_means = self._means[split_mask].expand(2, -1, -1).flatten(end_dim=1) + offsets
-        split_scales = split_scales.mul(0.625).log()
         split_sh_coefficients_0 = self._sh_coefficients_0[split_mask].expand(2, -1, -1, -1).flatten(end_dim=1)
         split_sh_coefficients_rest = self._sh_coefficients_rest[split_mask].expand(2, -1, -1, -1).flatten(end_dim=1)
-        split_opacities = self._opacities[split_mask].expand(2, -1, -1).flatten(end_dim=1)
         split_distance_decay = self._distance_decay[split_mask].expand(2, -1, -1).flatten(end_dim=1)
+
+        if improved_gs_plus is not None and improved_gs_plus.LONG_AXIS_SPLIT and split_mask.any():
+            parent_scales = self._scales[split_mask].exp()
+            parent_rotations = self._rotations[split_mask]
+            parent_means = self._means[split_mask]
+            parent_opacities = self.opacities[split_mask]
+
+            axis_idx = parent_scales.argmax(dim=1, keepdim=True)
+            axis_mask = torch.zeros_like(parent_scales).scatter_(1, axis_idx, 1.0)
+            spacing = parent_scales.max(dim=1, keepdim=True).values
+            local_offset = axis_mask * spacing
+            rotation_matrices = quaternion_to_rotation_matrix(parent_rotations)
+            world_offset = (rotation_matrices @ local_offset[..., None])[..., 0]
+            split_means = torch.cat([parent_means + world_offset, parent_means - world_offset], dim=0)
+
+            scale_factors = torch.full_like(parent_scales, float(improved_gs_plus.OTHER_AXES_FACTOR))
+            scale_factors.scatter_(1, axis_idx, float(improved_gs_plus.LONG_AXIS_FACTOR))
+            child_scales = (parent_scales * scale_factors).log()
+            split_scales = child_scales.expand(2, -1, -1).flatten(end_dim=1)
+
+            child_opacities = (parent_opacities * float(improved_gs_plus.CHILD_OPACITY_FACTOR)).clamp(
+                min=torch.finfo(parent_opacities.dtype).eps,
+                max=1.0 - torch.finfo(parent_opacities.dtype).eps,
+            ).logit()
+            split_opacities = child_opacities.expand(2, -1, -1).flatten(end_dim=1)
+        else:
+            split_scales = self._scales[split_mask].exp().expand(2, -1, -1).flatten(end_dim=1)
+            offsets = (quaternion_to_rotation_matrix(split_rotations) @ (split_scales * torch.randn_like(split_scales))[..., None])[..., 0]
+            split_means = self._means[split_mask].expand(2, -1, -1).flatten(end_dim=1) + offsets
+            split_scales = split_scales.mul(0.625).log()
+            split_opacities = self._opacities[split_mask].expand(2, -1, -1).flatten(end_dim=1)
 
         n_new_gaussians = n_new_gaussians_duplicate + n_new_gaussians_split
         param_groups = extend_param_groups(self.optimizer, {
