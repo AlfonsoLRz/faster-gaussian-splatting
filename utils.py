@@ -3,8 +3,12 @@
 import io
 import warnings
 import contextlib
+from pathlib import Path
+from typing import Any
 
+import numpy as np
 import torch
+from PIL import Image
 
 from Datasets.Base import BaseDataset
 from Logging import Logger
@@ -50,3 +54,66 @@ def carve(points: torch.Tensor, dataset: BaseDataset, in_all_frustums: bool, enf
             in_alpha_all[in_frustum] &= valid_alpha
     valid_mask = in_frustum_any & in_alpha_all & in_frustum_all
     return points[valid_mask].contiguous()
+
+
+def _candidate_view_paths(view: Any) -> list[Path]:
+    """Collect likely image path candidates from a training view."""
+    candidates: list[Path] = []
+    attribute_names = (
+        'image_path',
+        'rgb_path',
+        'path',
+        'file_path',
+        'image_file',
+        'filename',
+        'name',
+    )
+    objects_to_check = [view, getattr(view, 'camera', None)]
+
+    for obj in objects_to_check:
+        if obj is None:
+            continue
+        for attribute_name in attribute_names:
+            value = getattr(obj, attribute_name, None)
+            if isinstance(value, (str, Path)) and str(value):
+                candidates.append(Path(value))
+    return candidates
+
+
+def resolve_heatmap_path(
+    view: Any,
+    subdirectory: str = 'fvvdp_outputs',
+    suffix: str = '_heatmap_gray.png',
+) -> Path | None:
+    """Return the FovVideoVDP heatmap path corresponding to a training image view."""
+    for candidate in _candidate_view_paths(view):
+        search_directories = [candidate.parent]
+        if subdirectory:
+            search_directories.insert(0, candidate.parent / subdirectory)
+
+        for search_directory in search_directories:
+            direct_candidate = search_directory / f'{candidate.stem}{suffix}'
+            if direct_candidate.exists():
+                return direct_candidate
+
+            if candidate.suffix:
+                suffix_replaced = search_directory / candidate.name.replace(candidate.suffix, suffix)
+                if suffix_replaced.exists():
+                    return suffix_replaced
+
+    return None
+
+
+def load_fovvideovdp_heatmap(
+    view: Any,
+    device: torch.device | str,
+    subdirectory: str = 'fvvdp_outputs',
+    suffix: str = '_heatmap_gray.png',
+) -> torch.Tensor | None:
+    """Load a single-channel FovVideoVDP heatmap corresponding to the given training view."""
+    heatmap_path = resolve_heatmap_path(view, subdirectory=subdirectory, suffix=suffix)
+    if heatmap_path is None:
+        return None
+
+    heatmap_np = np.asarray(Image.open(heatmap_path).convert('L'), dtype=np.float32) / 255.0
+    return torch.from_numpy(heatmap_np).to(device=device)

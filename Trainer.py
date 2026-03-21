@@ -10,7 +10,7 @@ from Logging import Logger
 from Methods.Base.GuiTrainer import GuiTrainer
 from Methods.Base.utils import pre_training_callback, training_callback, post_training_callback
 from Methods.FasterGS.Loss import FasterGSLoss
-from Methods.FasterGS.utils import enable_expandable_segments, carve
+from Methods.FasterGS.utils import enable_expandable_segments, carve, load_fovvideovdp_heatmap
 from Optim.Samplers.DatasetSamplers import DatasetSampler
 
 
@@ -21,6 +21,14 @@ from Optim.Samplers.DatasetSamplers import DatasetSampler
     DENSIFICATION_INTERVAL=100,
     DENSIFICATION_GRAD_THRESHOLD=0.0002,
     DENSIFICATION_PERCENT_DENSE=0.01,
+    FOVVIDEOVDP_DENSIFICATION=Framework.ConfigParameterList(
+        USE=False,
+        HEATMAP_SUBDIRECTORY='fvvdp_outputs',
+        HEATMAP_SUFFIX='_heatmap_gray.png',
+        WEIGHT=1.0,
+        THRESHOLD=0.25,
+        LOG_MISSING_ONCE=True,
+    ),
     SPEEDYSPLAT_PRUNING=Framework.ConfigParameterList(
         USE=False,
         START_ITERATION=6_000,
@@ -81,6 +89,7 @@ class FasterGSTrainer(GuiTrainer):
 
     def __init__(self, **kwargs) -> None:
         self.requires_empty_cache = True
+        self._missing_fovvideovdp_heatmaps: set[str] = set()
         if not Framework.config.TRAINING.GUI.ACTIVATE:
             if enable_expandable_segments():
                 self.requires_empty_cache = False
@@ -177,6 +186,8 @@ class FasterGSTrainer(GuiTrainer):
 
         if not self.USE_MCMC:
             self.model.gaussians.reset_densification_info()
+            if self.FOVVIDEOVDP_DENSIFICATION.USE:
+                self.model.gaussians.enable_perceptual_densification()
         if self.FILTER_3D.USE:
             self.model.gaussians.setup_3d_filter(self.FILTER_3D, dataset)
 
@@ -196,7 +207,9 @@ class FasterGSTrainer(GuiTrainer):
             self.model.gaussians.adaptive_density_control(
                 self.DENSIFICATION_GRAD_THRESHOLD,
                 0.005,
-                iteration > self.OPACITY_RESET_INTERVAL
+                iteration > self.OPACITY_RESET_INTERVAL,
+                perceptual_weight=self.FOVVIDEOVDP_DENSIFICATION.WEIGHT if self.FOVVIDEOVDP_DENSIFICATION.USE else 0.0,
+                perceptual_threshold=self.FOVVIDEOVDP_DENSIFICATION.THRESHOLD if self.FOVVIDEOVDP_DENSIFICATION.USE else 0.0,
             )
 
             if (
@@ -212,6 +225,8 @@ class FasterGSTrainer(GuiTrainer):
 
             if iteration < self.DENSIFICATION_END_ITERATION:
                 self.model.gaussians.reset_densification_info()
+                if self.FOVVIDEOVDP_DENSIFICATION.USE:
+                    self.model.gaussians.enable_perceptual_densification()
 
         if self.requires_empty_cache:
             torch.cuda.empty_cache()
@@ -287,6 +302,31 @@ class FasterGSTrainer(GuiTrainer):
             rgb_gt = apply_background_color(rgb_gt, alpha_gt, bg_color)
 
         render_loss = self.loss(image, rgb_gt)
+
+        if self.FOVVIDEOVDP_DENSIFICATION.USE and iteration < self.DENSIFICATION_END_ITERATION and not self.USE_MCMC:
+            heatmap = load_fovvideovdp_heatmap(
+                view,
+                device=image.device,
+                subdirectory=self.FOVVIDEOVDP_DENSIFICATION.HEATMAP_SUBDIRECTORY,
+                suffix=self.FOVVIDEOVDP_DENSIFICATION.HEATMAP_SUFFIX,
+            )
+            if heatmap is None:
+                if self.FOVVIDEOVDP_DENSIFICATION.LOG_MISSING_ONCE:
+                    heatmap_key = str(getattr(view, 'image_path', getattr(view, 'path', 'unknown_view')))
+                    if heatmap_key not in self._missing_fovvideovdp_heatmaps:
+                        self._missing_fovvideovdp_heatmaps.add(heatmap_key)
+                        Logger.log_warning(
+                            f'no FovVideoVDP heatmap found for training view {heatmap_key!r} '
+                            f'in subdirectory {self.FOVVIDEOVDP_DENSIFICATION.HEATMAP_SUBDIRECTORY!r} '
+                            f'with suffix {self.FOVVIDEOVDP_DENSIFICATION.HEATMAP_SUFFIX!r}'
+                        )
+            else:
+                projected_points, _, in_frustum = view.project_points(self.model.gaussians.means.detach())
+                self.model.gaussians.accumulate_perceptual_densification_info(
+                    projected_points=projected_points,
+                    in_frustum_mask=in_frustum,
+                    heatmap=heatmap,
+                )
 
         if use_clod:
             eta_actual = lod_meta['eta_actual']
