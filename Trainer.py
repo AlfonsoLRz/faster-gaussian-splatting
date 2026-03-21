@@ -21,6 +21,20 @@ from Optim.Samplers.DatasetSamplers import DatasetSampler
     DENSIFICATION_INTERVAL=100,
     DENSIFICATION_GRAD_THRESHOLD=0.0002,
     DENSIFICATION_PERCENT_DENSE=0.01,
+    IMPROVED_GS_PLUS=Framework.ConfigParameterList(
+        ENABLE=False,
+        SPLIT_ONLY=True,
+        LONG_AXIS_SPLIT=True,
+        LONG_AXIS_FACTOR=0.5,
+        OTHER_AXES_FACTOR=0.8,
+        CHILD_OPACITY_FACTOR=0.5,
+        THRESHOLD_PHASES=((0.0, 1.0), (0.5, 0.75), (0.75, 0.5), (0.875, 0.25)),
+        THRESHOLD_PAUSE_ITERS=0,
+        PRUNE_LOW_OPACITY=True,
+        PRUNE_START_ITERATION=6_000,
+        PRUNE_INTERVAL=3_000,
+        PRUNE_MIN_OPACITY=0.005,
+    ),
     SPEEDYSPLAT_PRUNING=Framework.ConfigParameterList(
         USE=False,
         START_ITERATION=6_000,
@@ -139,6 +153,24 @@ class FasterGSTrainer(GuiTrainer):
         smax = max(self.CLOD.VIRTUAL_SCALE_MAX, 1.0)
         return (1.0 - 0.5 * virtual_scale / smax) ** 2
 
+    def improved_gs_plus_grad_threshold(self, iteration: int) -> float:
+        """Returns the densification threshold, optionally following the ImprovedGS+ schedule."""
+        if not self.IMPROVED_GS_PLUS.ENABLE:
+            return self.DENSIFICATION_GRAD_THRESHOLD
+
+        progress = 0.0
+        if self.DENSIFICATION_END_ITERATION > self.DENSIFICATION_START_ITERATION:
+            progress = (iteration - self.DENSIFICATION_START_ITERATION) / (
+                self.DENSIFICATION_END_ITERATION - self.DENSIFICATION_START_ITERATION
+            )
+        progress = max(0.0, min(1.0, progress))
+
+        factor = 1.0
+        for phase_start, phase_factor in self.IMPROVED_GS_PLUS.THRESHOLD_PHASES:
+            if progress >= phase_start:
+                factor = phase_factor
+        return self.DENSIFICATION_GRAD_THRESHOLD * factor
+
     @pre_training_callback(priority=50)
     @torch.no_grad()
     def create_sampler(self, _, dataset: 'BaseDataset') -> None:
@@ -194,10 +226,22 @@ class FasterGSTrainer(GuiTrainer):
             self.model.gaussians.mcmc_densification(min_opacity=0.005, cap_max=self.MAX_PRIMITIVES)
         else:
             self.model.gaussians.adaptive_density_control(
-                self.DENSIFICATION_GRAD_THRESHOLD,
+                self.improved_gs_plus_grad_threshold(iteration),
                 0.005,
-                iteration > self.OPACITY_RESET_INTERVAL
+                iteration > self.OPACITY_RESET_INTERVAL,
+                improved_gs_plus=self.IMPROVED_GS_PLUS if self.IMPROVED_GS_PLUS.ENABLE else None,
             )
+
+            if (
+                self.IMPROVED_GS_PLUS.ENABLE
+                and self.IMPROVED_GS_PLUS.PRUNE_LOW_OPACITY
+                and iteration >= self.IMPROVED_GS_PLUS.PRUNE_START_ITERATION
+                and (iteration - self.IMPROVED_GS_PLUS.PRUNE_START_ITERATION) % self.IMPROVED_GS_PLUS.PRUNE_INTERVAL == 0
+            ):
+                min_opacity = self.IMPROVED_GS_PLUS.PRUNE_MIN_OPACITY
+                self.model.gaussians.prune(
+                    self.model.gaussians.opacities.flatten() < min_opacity
+                )
 
             if (
                 self.SPEEDYSPLAT_PRUNING.USE
