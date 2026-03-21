@@ -37,6 +37,7 @@ class Gaussians(torch.nn.Module):
         self.register_parameter('_distance_decay', None)
 
         self._densification_info = None
+        self._perceptual_densification_info = None
         self.optimizer = None
         self.percent_dense = 0.0
         self.training_cameras_extent = 1.0
@@ -135,6 +136,11 @@ class Gaussians(torch.nn.Module):
     def densification_info(self) -> torch.Tensor:
         """Returns the current densification info buffers (2, N)."""
         return self._densification_info
+
+    @property
+    def perceptual_densification_info(self) -> torch.Tensor | None:
+        """Returns the current perceptual densification info buffers (2, N) or None."""
+        return self._perceptual_densification_info
 
     @property
     def covariances(self) -> torch.Tensor:
@@ -301,6 +307,8 @@ class Gaussians(torch.nn.Module):
 
         if self._densification_info is not None:
             self._densification_info = self._densification_info[:, valid_mask].contiguous()
+        if self._perceptual_densification_info is not None:
+            self._perceptual_densification_info = self._perceptual_densification_info[:, valid_mask].contiguous()
         if self._filter_3d is not None:
             self._filter_3d = self._filter_3d[valid_mask].contiguous()
 
@@ -318,15 +326,63 @@ class Gaussians(torch.nn.Module):
 
         if self._densification_info is not None:
             self._densification_info = self._densification_info[:, ordering].contiguous()
+        if self._perceptual_densification_info is not None:
+            self._perceptual_densification_info = self._perceptual_densification_info[:, ordering].contiguous()
         if self._filter_3d is not None:
             self._filter_3d = self._filter_3d[ordering].contiguous()
 
     def reset_densification_info(self) -> None:
         self._densification_info = torch.zeros((2, self._means.shape[0]), dtype=torch.float32, device='cuda')
+        if self._perceptual_densification_info is not None:
+            self._perceptual_densification_info = torch.zeros((2, self._means.shape[0]), dtype=torch.float32, device='cuda')
 
-    def adaptive_density_control(self, grad_threshold: float, min_opacity: float, prune_large_gaussians: bool) -> None:
+    @torch.no_grad()
+    def enable_perceptual_densification(self) -> None:
+        """Enable perceptual densification bookkeeping."""
+        self._perceptual_densification_info = torch.zeros((2, self._means.shape[0]), dtype=torch.float32, device='cuda')
+
+    @torch.no_grad()
+    def accumulate_perceptual_densification_info(
+        self,
+        projected_points: torch.Tensor,
+        in_frustum_mask: torch.Tensor,
+        heatmap: torch.Tensor,
+    ) -> None:
+        """Accumulate heatmap scores by sampling projected Gaussian centers."""
+        if self._perceptual_densification_info is None or not in_frustum_mask.any():
+            return
+
+        heatmap = heatmap.to(device=self._means.device, dtype=torch.float32)
+        height, width = heatmap.shape[-2:]
+        xy_screen = torch.floor(projected_points[in_frustum_mask]).long()
+        valid_xy = (
+            (xy_screen[:, 0] >= 0)
+            & (xy_screen[:, 0] < width)
+            & (xy_screen[:, 1] >= 0)
+            & (xy_screen[:, 1] < height)
+        )
+        if not valid_xy.any():
+            return
+
+        visible_indices = torch.where(in_frustum_mask)[0][valid_xy]
+        sampled_scores = heatmap[xy_screen[valid_xy, 1], xy_screen[valid_xy, 0]]
+        self._perceptual_densification_info[0, visible_indices] += 1.0
+        self._perceptual_densification_info[1, visible_indices] += sampled_scores
+
+    def adaptive_density_control(
+        self,
+        grad_threshold: float,
+        min_opacity: float,
+        prune_large_gaussians: bool,
+        perceptual_weight: float = 0.0,
+        perceptual_threshold: float = 0.0,
+    ) -> None:
         """Densify Gaussians and prune those that are not visible or too large."""
-        densification_mask = self.densification_info[1] >= grad_threshold * self.densification_info[0].clamp_min(1.0)
+        grad_score = self.densification_info[1] / self.densification_info[0].clamp_min(1.0)
+        densification_mask = grad_score >= grad_threshold
+        if self._perceptual_densification_info is not None:
+            perceptual_score = self._perceptual_densification_info[1] / self._perceptual_densification_info[0].clamp_min(1.0)
+            densification_mask |= perceptual_score * perceptual_weight >= perceptual_threshold
         is_small = torch.max(self._scales, dim=1).values <= math.log(self.percent_dense * self.training_cameras_extent)
 
         duplicate_mask = densification_mask & is_small
@@ -370,6 +426,7 @@ class Gaussians(torch.nn.Module):
         self._distance_decay = param_groups['distance_decay']
 
         self._densification_info = None
+        self._perceptual_densification_info = None
         self._filter_3d = None
 
         prune_mask = torch.cat([split_mask, torch.zeros(n_new_gaussians, dtype=torch.bool, device='cuda')])
@@ -417,6 +474,7 @@ class Gaussians(torch.nn.Module):
             reset_state(self.optimizer, indices=sampled_indices)
 
             self._densification_info = None
+            self._perceptual_densification_info = None
             self._filter_3d = None
 
         current_n_points = self._means.shape[0]
@@ -460,6 +518,7 @@ class Gaussians(torch.nn.Module):
             reset_state(self.optimizer, indices=sampled_indices)
 
             self._densification_info = None
+            self._perceptual_densification_info = None
             self._filter_3d = None
 
     def apply_morton_ordering(self) -> None:
@@ -495,6 +554,7 @@ class Gaussians(torch.nn.Module):
         self._filter_3d = None
 
         self._densification_info = None
+        self._perceptual_densification_info = None
 
         prune_mask = self.opacities.flatten() < min_opacity
         prune_mask |= self._rotations.mul(self._rotations).sum(dim=1) < 1e-8
