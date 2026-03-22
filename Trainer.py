@@ -16,11 +16,11 @@ from Optim.Samplers.DatasetSamplers import DatasetSampler
 
 @Framework.Configurable.configure(
     NUM_ITERATIONS=30_000,
-    DENSIFICATION_START_ITERATION=600,
-    DENSIFICATION_END_ITERATION=5_000,
+    DENSIFICATION_START_ITERATION=600,  # while official code states 500, densification actually starts at 600 there
+    DENSIFICATION_END_ITERATION=14_900,  # should be set to 24900 when using MCMC; while official code states 15000, densification actually stops at 14900 there
     DENSIFICATION_INTERVAL=100,
-    DENSIFICATION_GRAD_THRESHOLD=0.0002,
-    DENSIFICATION_PERCENT_DENSE=0.01,
+    DENSIFICATION_GRAD_THRESHOLD=0.0002,  # only used when USE_MCMC=False
+    DENSIFICATION_PERCENT_DENSE=0.01,  # only used when USE_MCMC=False
     FOVVIDEOVDP_DENSIFICATION=Framework.ConfigParameterList(
         USE=False,
         HEATMAP_SUBDIRECTORY='fvvdp_outputs',
@@ -30,7 +30,7 @@ from Optim.Samplers.DatasetSamplers import DatasetSampler
         LOG_MISSING_ONCE=True,
     ),
     SPEEDYSPLAT_PRUNING=Framework.ConfigParameterList(
-        USE=False,
+        USE=False,  # only used when USE_MCMC=False
         START_ITERATION=6_000,
         END_ITERATION=30_000,
         INTERVAL=3_000,
@@ -38,47 +38,47 @@ from Optim.Samplers.DatasetSamplers import DatasetSampler
         HARD_PRUNING_RATIO=0.3,
     ),
     USE_MCMC=False,
-    MAX_PRIMITIVES=1_000_000,
-    OPACITY_RESET_INTERVAL=3_000,
-    EXTRA_OPACITY_RESET_ITERATION=500,
-    MORTON_ORDERING_INTERVAL=5000,
-    MORTON_ORDERING_END_ITERATION=15000,
+    MAX_PRIMITIVES=5_000_000,  # only used when USE_MCMC=True
+    OPACITY_RESET_INTERVAL=3_000,  # will be skipped when USE_MCMC=True
+    EXTRA_OPACITY_RESET_ITERATION=500,  # will be skipped when USE_MCMC=True
+    MORTON_ORDERING_INTERVAL=5000,  # lowering to 2500 or 1000 may improve performance when number of Gaussians is high
+    MORTON_ORDERING_END_ITERATION=15000,  # should be set to 25000 when using MCMC
     FILTER_3D=Framework.ConfigParameterList(
         USE=False,
-        ORIGINAL_FORMULATION=False,
+        ORIGINAL_FORMULATION=False,  # if True, the original formulation from the Mip-Splatting paper is used
         FILTER_VARIANCE=0.2,
     ),
-    USE_RANDOM_BACKGROUND_COLOR=False,
+    USE_RANDOM_BACKGROUND_COLOR=False,  # prevents the model from overfitting to the background color
     MIN_OPACITY_AFTER_TRAINING=1 / 255,
     RANDOM_INITIALIZATION=Framework.ConfigParameterList(
-        FORCE=False,
-        N_POINTS=100_000,
-        ENABLE_CARVING=True,
-        CARVING_IN_ALL_FRUSTUMS=False,
-        CARVING_ENFORCE_ALPHA=False,
+        FORCE=False,  # if True, the point cloud from the dataset will be ignored
+        N_POINTS=100_000,  # number of random points to be sampled within the scene bounding box
+        ENABLE_CARVING=True,  # removes points that are never in-frustum in any training view
+        CARVING_IN_ALL_FRUSTUMS=False,  # removes points not in-frustum in all views
+        CARVING_ENFORCE_ALPHA=False,  # removes points that project to a pixel with alpha=0 in any view where the point is in-frustum
     ),
     CLOD=Framework.ConfigParameterList(
         USE=True,
-        START_ITERATION=8_000,
+        START_ITERATION=5_000,
         VIRTUAL_SCALE_MIN=1.0,
-        VIRTUAL_SCALE_MAX=10.0,
+        VIRTUAL_SCALE_MAX=5.0,
         TAU=1e-2,
-        LAMBDA_REG=0.05,
+        LAMBDA_REG=1.0,
         ETA_EXPONENT=1.5,
     ),
     LOSS=Framework.ConfigParameterList(
-        LAMBDA_L1=0.8,
-        LAMBDA_DSSIM=0.2,
-        LAMBDA_OPACITY_REGULARIZATION=0.0,
-        LAMBDA_SCALE_REGULARIZATION=0.001,
+        LAMBDA_L1=0.8,  # weight for the per-pixel L1 loss on the rgb image
+        LAMBDA_DSSIM=0.2,  # weight for the DSSIM loss on the rgb image
+        LAMBDA_OPACITY_REGULARIZATION=0.0,  # should be set to 0.01 when using MCMC
+        LAMBDA_SCALE_REGULARIZATION=0.001,  # should be set to 0.01 when using MCMC
     ),
     OPTIMIZER=Framework.ConfigParameterList(
         LEARNING_RATE_MEANS_INIT=0.00016,
         LEARNING_RATE_MEANS_FINAL=0.0000016,
         LEARNING_RATE_MEANS_MAX_STEPS=30_000,
         LEARNING_RATE_SH_COEFFICIENTS_0=0.0025,
-        LEARNING_RATE_SH_COEFFICIENTS_REST=0.000125,
-        LEARNING_RATE_OPACITIES=0.025,
+        LEARNING_RATE_SH_COEFFICIENTS_REST=0.000125,  # 0.0025 / 20
+        LEARNING_RATE_OPACITIES=0.025,  # use 0.05 (old default in official code) with MCMC densification or Speedy-Splat pruning to match the respective paper
         LEARNING_RATE_SCALES=0.005,
         LEARNING_RATE_ROTATIONS=0.001,
         LEARNING_RATE_DISTANCE_DECAY=0.01,
@@ -135,7 +135,7 @@ class FasterGSTrainer(GuiTrainer):
         return (
             self.CLOD.USE
             and iteration >= self.CLOD.START_ITERATION
-            and iteration >= self.DENSIFICATION_END_ITERATION
+            #and iteration >= self.DENSIFICATION_END_ITERATION
         )
 
     def clod_regularization_loss(self, eta_actual: torch.Tensor, virtual_scale: float) -> torch.Tensor:
