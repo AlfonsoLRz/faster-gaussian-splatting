@@ -49,7 +49,7 @@ def save_cvvdp_heatmap_gray(heatmap_tensor, out_path):
     iio.imwrite(out_path, hm_u8)
 
 
-dataset = r"C:/Github/Forks/nerficg/dataset/mipnerf360/kitchen/images"
+dataset = r"C:/Github/Forks/nerficg/dataset/mipnerf360/garden/images"
 image_extension = ".JPG"
 image_files = [f for f in os.listdir(dataset) if f.endswith(image_extension)]
 

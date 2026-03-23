@@ -85,7 +85,7 @@ def resolve_heatmap_path(
     subdirectory: str = 'fvvdp_outputs',
     suffix: str = '_heatmap_gray.png',
 ) -> Path | None:
-    """Return the FovVideoVDP heatmap path corresponding to a training image view."""
+    """Return the VideoVDP heatmap path corresponding to a training image view."""
     for candidate in _candidate_view_paths(view):
         search_directories = [candidate.parent]
         if subdirectory:
@@ -104,13 +104,13 @@ def resolve_heatmap_path(
     return None
 
 
-def load_fovvideovdp_heatmap(
+def load_videovdp_heatmap(
     view: Any,
     device: torch.device | str,
     subdirectory: str = 'fvvdp_outputs',
     suffix: str = '_heatmap_gray.png',
 ) -> torch.Tensor | None:
-    """Load a single-channel FovVideoVDP heatmap corresponding to the given training view."""
+    """Load a single-channel VideoVDP heatmap corresponding to the given training view."""
     heatmap_path = resolve_heatmap_path(view, subdirectory=subdirectory, suffix=suffix)
     if heatmap_path is None:
         return None

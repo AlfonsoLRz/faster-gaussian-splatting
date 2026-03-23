@@ -623,7 +623,12 @@ class FasterGSModel(BaseModel):
         if self.gaussians is None or not (data := self.gaussians.as_ply_dict()):
             return data
 
-        splat_render_mode = 'mip-0.1' if Framework.config.RENDERER.PROPER_ANTIALIASING else 'default'
+        try:
+            proper_antialiasing = Framework.config.RENDERER.PROPER_ANTIALIASING
+        except AttributeError:
+            proper_antialiasing = False
+
+        splat_render_mode = 'mip-0.1' if proper_antialiasing else 'default'
         data['comments'] = [f'SplatRenderMode: {splat_render_mode}', 'Generated with NeRFICG/FasterGS']
 
         return data
