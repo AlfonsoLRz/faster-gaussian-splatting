@@ -15,6 +15,7 @@ try:
     from .FasterGSCudaBackend.torch_bindings.adam import FusedAdam
     from .FasterGSCudaBackend.torch_bindings.filter3d import update_3d_filter
     from .FasterGSCudaBackend.torch_bindings.densification import relocation_adjustment, add_noise
-    __all__ = ['diff_rasterize', 'rasterize', 'update_pruning_scores', 'RasterizerSettings', 'FusedAdam', 'update_3d_filter', 'relocation_adjustment', 'add_noise']
+    from .FasterGSCudaBackend.torch_bindings.edge_detection import compute_edge_scores
+    __all__ = ['diff_rasterize', 'rasterize', 'update_pruning_scores', 'RasterizerSettings', 'FusedAdam', 'update_3d_filter', 'relocation_adjustment', 'add_noise', 'compute_edge_scores',]
 except ImportError as e:
     raise Framework.ExtensionError(name=__extension_name__, install_command=__install_command__)

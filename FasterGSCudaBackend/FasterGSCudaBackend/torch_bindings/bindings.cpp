@@ -3,11 +3,13 @@
 #include "adam.h"
 #include "filter3d.h"
 #include "densification_api.h"
+#include "edge_detection.h"
 
 namespace rasterization_api = faster_gs::rasterization;
 namespace adam_api = faster_gs::adam;
 namespace filter3d_api = faster_gs::filter3d;
 namespace densification_api = faster_gs::densification;
+namespace edge_detection_api = faster_gs::edge_detection;
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("forward", &rasterization_api::forward_wrapper);
@@ -18,4 +20,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("update_3d_filter", &filter3d_api::update_3d_filter_wrapper);
     m.def("relocation_adjustment", &densification_api::relocation_wrapper);
     m.def("add_noise", &densification_api::add_noise_wrapper);
+    m.def("compute_edge_scores", &edge_detection_api::compute_edge_scores_wrapper);
 }
