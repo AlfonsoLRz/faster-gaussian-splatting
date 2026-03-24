@@ -1,0 +1,1 @@
+python C:\Github\Forks\nerficg\src\Methods\FasterGS\edge_scores_test.py --input "C:\Github\Forks\nerficg\dataset\mipnerf360\bicycle\images\_DSC8679.JPG" --outdir "C:\Github\Forks\nerficg\dataset\mipnerf360\bicycle\images"
