@@ -38,6 +38,7 @@ class Gaussians(torch.nn.Module):
 
         self._densification_info = None
         self._perceptual_densification_info = None
+        self._edge_densification_info = None
         self.optimizer = None
         self.percent_dense = 0.0
         self.training_cameras_extent = 1.0
@@ -141,6 +142,10 @@ class Gaussians(torch.nn.Module):
     def perceptual_densification_info(self) -> torch.Tensor | None:
         """Returns the current perceptual densification info buffers (2, N) or None."""
         return self._perceptual_densification_info
+    
+    @property
+    def edge_densification_info(self) -> torch.Tensor | None:
+        return self._edge_densification_info
 
     @property
     def covariances(self) -> torch.Tensor:
@@ -270,15 +275,23 @@ class Gaussians(torch.nn.Module):
         self.lr_means_scheduler = LRDecayPolicy(
             lr_init=training_wrapper.OPTIMIZER.LEARNING_RATE_MEANS_INIT * self.training_cameras_extent,
             lr_final=training_wrapper.OPTIMIZER.LEARNING_RATE_MEANS_FINAL * self.training_cameras_extent,
-            max_steps=training_wrapper.OPTIMIZER.LEARNING_RATE_MEANS_MAX_STEPS
+            max_steps=training_wrapper.OPTIMIZER.LEARNING_RATE_MEANS_MAX_STEPS,
+        )
+        self.lr_scales_scheduler = LRDecayPolicy(
+            lr_init=0.020,
+            lr_final=0.002,
+            max_steps=30_000,
         )
 
     def update_learning_rate(self, iteration: int) -> None:
-        """Computes the current learning rate for the given iteration."""
         self.lr_means = self.lr_means_scheduler(iteration)
+        self.lr_scales = self.lr_scales_scheduler(iteration)
+
         for param_group in self.optimizer.param_groups:
             if param_group['name'] == 'means':
                 param_group['lr'] = self.lr_means
+            elif param_group['name'] == 'scales':
+                param_group['lr'] = self.lr_scales
 
     def reset_opacities(self) -> None:
         """Resets the opacities to a fixed value."""
@@ -291,6 +304,10 @@ class Gaussians(torch.nn.Module):
             coef = torch.sqrt(det1 / det2)
             opacities_new = (opacities_new.sigmoid() / coef[..., None]).logit(eps=1e-6)
         replace_param_group_data(self.optimizer, opacities_new, 'opacities')
+
+    @torch.no_grad()
+    def enable_edge_densification(self) -> None:
+        self._edge_densification_info = torch.zeros((2, self._means.shape[0]), dtype=torch.float32, device='cuda')
 
     def prune(self, prune_mask: torch.Tensor) -> None:
         """Prunes Gaussians that are not visible or too large."""
@@ -309,6 +326,8 @@ class Gaussians(torch.nn.Module):
             self._densification_info = self._densification_info[:, valid_mask].contiguous()
         if self._perceptual_densification_info is not None:
             self._perceptual_densification_info = self._perceptual_densification_info[:, valid_mask].contiguous()
+        if self._edge_densification_info is not None:
+            self._edge_densification_info = self._edge_densification_info[:, valid_mask].contiguous()
         if self._filter_3d is not None:
             self._filter_3d = self._filter_3d[valid_mask].contiguous()
 
@@ -328,11 +347,15 @@ class Gaussians(torch.nn.Module):
             self._densification_info = self._densification_info[:, ordering].contiguous()
         if self._perceptual_densification_info is not None:
             self._perceptual_densification_info = self._perceptual_densification_info[:, ordering].contiguous()
+        if self._edge_densification_info is not None:
+            self._edge_densification_info = self._edge_densification_info[:, ordering].contiguous()
         if self._filter_3d is not None:
             self._filter_3d = self._filter_3d[ordering].contiguous()
 
     def reset_densification_info(self) -> None:
         self._densification_info = torch.zeros((2, self._means.shape[0]), dtype=torch.float32, device='cuda')
+        if self._edge_densification_info is not None:
+            self._edge_densification_info = torch.zeros((2, self._means.shape[0]), dtype=torch.float32, device='cuda')
         if self._perceptual_densification_info is not None:
             self._perceptual_densification_info = torch.zeros((2, self._means.shape[0]), dtype=torch.float32, device='cuda')
 
@@ -368,6 +391,33 @@ class Gaussians(torch.nn.Module):
         sampled_scores = heatmap[xy_screen[valid_xy, 1], xy_screen[valid_xy, 0]]
         self._perceptual_densification_info[0, visible_indices] += 1.0
         self._perceptual_densification_info[1, visible_indices] += sampled_scores
+
+    @torch.no_grad()
+    def accumulate_edge_densification_info(
+        self,
+        projected_points: torch.Tensor,
+        in_frustum_mask: torch.Tensor,
+        heatmap: torch.Tensor,
+    ) -> None:
+        if self._edge_densification_info is None or not in_frustum_mask.any():
+            return
+
+        heatmap = heatmap.to(device=self._means.device, dtype=torch.float32)
+        height, width = heatmap.shape[-2:]
+        xy_screen = torch.floor(projected_points[in_frustum_mask]).long()
+
+        valid_xy = (
+            (xy_screen[:, 0] >= 0) & (xy_screen[:, 0] < width) &
+            (xy_screen[:, 1] >= 0) & (xy_screen[:, 1] < height)
+        )
+        if not valid_xy.any():
+            return
+
+        visible_indices = torch.where(in_frustum_mask)[0][valid_xy]
+        sampled_scores = heatmap[xy_screen[valid_xy, 1], xy_screen[valid_xy, 0]]
+
+        self._edge_densification_info[0, visible_indices] += 1.0
+        self._edge_densification_info[1, visible_indices] += sampled_scores
 
     def adaptive_density_control(
         self,
@@ -521,6 +571,134 @@ class Gaussians(torch.nn.Module):
             self._perceptual_densification_info = None
             self._filter_3d = None
 
+    @torch.no_grad()
+    def improvedgs_densification(
+        self,
+        grad_threshold: float,
+        edge_threshold: float,
+        min_opacity: float,
+        prune_large_gaussians: bool,
+        edge_warmup: bool,
+        use_las: bool = True,
+        las_alpha: float = 0.5,
+        las_gamma: float = 0.85,
+        las_beta: float = 0.6,
+    ) -> None:
+        grad_score = self._densification_info[1] / self._densification_info[0].clamp_min(1.0)
+        grad_mask = grad_score >= grad_threshold
+
+        if self._edge_densification_info is not None:
+            edge_score = self._edge_densification_info[1] / self._edge_densification_info[0].clamp_min(1.0)
+            edge_mask = edge_score >= edge_threshold
+        else:
+            edge_score = None
+            edge_mask = grad_mask
+
+        # Paper: first 3 densification steps ignore gradient-threshold masking.
+        densification_mask = edge_mask if edge_warmup else (edge_mask & grad_mask)
+
+        if not densification_mask.any():
+            self._densification_info = None
+            self._edge_densification_info = None
+            self._filter_3d = None
+            return
+
+        if use_las:
+            self._long_axis_split(
+                split_mask=densification_mask,
+                alpha=las_alpha,
+                gamma=las_gamma,
+                beta=las_beta,
+            )
+        else:
+            raise NotImplementedError("Paper-faithful path should use LAS.")
+
+        self._densification_info = None
+        self._edge_densification_info = None
+        self._filter_3d = None
+
+        prune_mask = self._opacities.flatten() < math.log(min_opacity / (1 - min_opacity))
+        prune_mask |= self._rotations.mul(self._rotations).sum(dim=1) < 1e-8
+        if prune_large_gaussians:
+            prune_mask |= self._scales.max(dim=1).values > math.log(0.1 * self.training_cameras_extent)
+        self.prune(prune_mask)
+
+    @torch.no_grad()
+    def _long_axis_split(
+        self,
+        split_mask: torch.Tensor,
+        alpha: float = 0.5,
+        gamma: float = 0.85,
+        beta: float = 0.6,
+    ) -> None:
+        idx = torch.where(split_mask)[0]
+        if idx.numel() == 0:
+            return
+
+        means = self._means[idx]                       # [M,3]
+        raw_scales = self._scales[idx]                 # [M,3]
+        rotations = self._rotations[idx]               # [M,4]
+        sh0 = self._sh_coefficients_0[idx]             # [M,1,3]
+        shrest = self._sh_coefficients_rest[idx]       # [M,K,3]
+        raw_opacities = self._opacities[idx]           # [M,1]
+        distance_decay = self._distance_decay[idx]     # [M,1]
+
+        phys_scales = raw_scales.exp()
+        lidx = phys_scales.argmax(dim=1)               # [M]
+
+        rotations = torch.nn.functional.normalize(rotations, dim=1)
+        R = quaternion_to_rotation_matrix(rotations)   # [M,3,3]
+        axis = R.gather(2, lidx[:, None, None].expand(-1, 3, 1)).squeeze(-1)   # [M,3]
+        offset_mag = phys_scales.gather(1, lidx[:, None]) * alpha               # [M,1]
+        offset = axis * offset_mag                                               # [M,3]
+
+        new_means = torch.cat([means + offset, means - offset], dim=0).contiguous()
+
+        new_raw_scales = raw_scales.repeat(2, 1).contiguous()
+        new_raw_scales += math.log(gamma)
+        lidx2 = lidx.repeat(2)
+        src_raw_scales = raw_scales.repeat(2, 1)
+        row_ids = torch.arange(new_raw_scales.shape[0], device=new_raw_scales.device)
+        new_raw_scales[row_ids, lidx2] = src_raw_scales[row_ids, lidx2] + math.log(alpha)
+
+        new_opacity_phys = (raw_opacities.sigmoid() * beta).clamp(1e-6, 1.0 - 1e-6)
+        new_raw_opacities = new_opacity_phys.logit().repeat(2, 1).contiguous()
+
+        new_rotations = rotations.repeat(2, 1).contiguous()
+        new_sh0 = torch.cat([sh0, sh0], dim=0).contiguous()
+        new_shrest = torch.cat([shrest, shrest], dim=0).contiguous()
+        new_distance_decay = distance_decay.repeat(2, 1).contiguous()
+
+        param_groups = extend_param_groups(self.optimizer, {
+            'means': new_means,
+            'sh_coefficients_0': new_sh0,
+            'sh_coefficients_rest': new_shrest,
+            'opacities': new_raw_opacities,
+            'scales': new_raw_scales,
+            'rotations': new_rotations,
+            'distance_decay': new_distance_decay,
+        })
+
+        self._means = param_groups['means']
+        self._sh_coefficients_0 = param_groups['sh_coefficients_0']
+        self._sh_coefficients_rest = param_groups['sh_coefficients_rest']
+        self._opacities = param_groups['opacities']
+        self._scales = param_groups['scales']
+        self._rotations = param_groups['rotations']
+        self._distance_decay = param_groups['distance_decay']
+
+        # These buffers still have the old size; clear them before prune().
+        self._densification_info = None
+        self._perceptual_densification_info = None
+        self._edge_densification_info = None
+        self._filter_3d = None
+
+        prune_mask = torch.cat([
+            split_mask,
+            torch.zeros(2 * idx.numel(), dtype=torch.bool, device=self._means.device)
+        ])
+        self.prune(prune_mask)
+
     def apply_morton_ordering(self) -> None:
         """Applies Morton ordering to the Gaussians."""
         morton_encoding = morton_encode(self._means.data)
@@ -555,6 +733,7 @@ class Gaussians(torch.nn.Module):
 
         self._densification_info = None
         self._perceptual_densification_info = None
+        self._edge_densification_info = None
 
         prune_mask = self.opacities.flatten() < min_opacity
         prune_mask |= self._rotations.mul(self._rotations).sum(dim=1) < 1e-8

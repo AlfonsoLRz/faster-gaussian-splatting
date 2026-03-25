@@ -11,18 +11,27 @@ from Methods.Base.GuiTrainer import GuiTrainer
 from Methods.Base.utils import pre_training_callback, training_callback, post_training_callback
 from Methods.FasterGS.Loss import FasterGSLoss
 from Methods.FasterGS.utils import enable_expandable_segments, carve, load_videovdp_heatmap
+from Methods.FasterGS.FasterGSCudaBackend.FasterGSCudaBackend.torch_bindings import compute_edge_scores
 from Optim.Samplers.DatasetSamplers import DatasetSampler
 
 
 @Framework.Configurable.configure(
     NUM_ITERATIONS=30_000,
-    DENSIFICATION_START_ITERATION=600,  # while official code states 500, densification actually starts at 600 there
-    DENSIFICATION_END_ITERATION=14_900,  # should be set to 24900 when using MCMC; while official code states 15000, densification actually stops at 14900 there
-    DENSIFICATION_INTERVAL=100,
+    DENSIFICATION_START_ITERATION=500,  # while official code states 500, densification actually starts at 600 there
+    DENSIFICATION_END_ITERATION=15_000,  # should be set to 24900 when using MCMC; while official code states 15000, densification actually stops at 14900 there
+    DENSIFICATION_INTERVAL=500,
     DENSIFICATION_GRAD_THRESHOLD=0.0002,  # only used when USE_MCMC=False
     DENSIFICATION_PERCENT_DENSE=0.01,  # only used when USE_MCMC=False
-    VIDEOVDP_DENSIFICATION=Framework.ConfigParameterList(
+    EDGE_DENSIFICATION=Framework.ConfigParameterList(
         USE=True,
+        THRESHOLD=0.20,          # tune; paper does not give a numeric value
+        WARMUP_STEPS=3,          # 500, 1000, 1500
+        HISTOGRAM_BINS=512,
+        EPS=1e-6,
+        DEBUG_SAVE=False,
+    ),
+    VIDEOVDP_DENSIFICATION=Framework.ConfigParameterList(
+        USE=False,
         HEATMAP_SUBDIRECTORY='cvvdp_outputs',
         HEATMAP_SUFFIX='_heatmap_gray.png',
         WEIGHT=1.0,
@@ -42,7 +51,7 @@ from Optim.Samplers.DatasetSamplers import DatasetSampler
     OPACITY_RESET_INTERVAL=3_000,  # will be skipped when USE_MCMC=True
     EXTRA_OPACITY_RESET_ITERATION=500,  # will be skipped when USE_MCMC=True
     MORTON_ORDERING_INTERVAL=5000,  # lowering to 2500 or 1000 may improve performance when number of Gaussians is high
-    MORTON_ORDERING_END_ITERATION=15000,  # should be set to 25000 when using MCMC
+    MORTON_ORDERING_END_ITERATION=15_000,  # should be set to 25000 when using MCMC
     FILTER_3D=Framework.ConfigParameterList(
         USE=False,
         ORIGINAL_FORMULATION=False,  # if True, the original formulation from the Mip-Splatting paper is used
@@ -186,6 +195,8 @@ class FasterGSTrainer(GuiTrainer):
 
         if not self.USE_MCMC:
             self.model.gaussians.reset_densification_info()
+            if self.EDGE_DENSIFICATION.USE:
+                self.model.gaussians.enable_edge_densification()
             if self.VIDEOVDP_DENSIFICATION.USE:
                 self.model.gaussians.enable_perceptual_densification()
         if self.FILTER_3D.USE:
@@ -200,33 +211,29 @@ class FasterGSTrainer(GuiTrainer):
     @training_callback(priority=100, start_iteration='DENSIFICATION_START_ITERATION', end_iteration='DENSIFICATION_END_ITERATION', iteration_stride='DENSIFICATION_INTERVAL')
     @torch.no_grad()
     def densify(self, iteration: int, dataset: 'BaseDataset') -> None:
-        """Apply densification."""
         if self.USE_MCMC:
             self.model.gaussians.mcmc_densification(min_opacity=0.005, cap_max=self.MAX_PRIMITIVES)
-        else:
-            self.model.gaussians.adaptive_density_control(
-                self.DENSIFICATION_GRAD_THRESHOLD,
-                0.005,
-                iteration > self.OPACITY_RESET_INTERVAL,
-                perceptual_weight=self.VIDEOVDP_DENSIFICATION.WEIGHT if self.VIDEOVDP_DENSIFICATION.USE else 0.0,
-                perceptual_threshold=self.VIDEOVDP_DENSIFICATION.THRESHOLD if self.VIDEOVDP_DENSIFICATION.USE else 0.0,
-            )
+            return
 
-            if (
-                self.SPEEDYSPLAT_PRUNING.USE
-                and self.SPEEDYSPLAT_PRUNING.START_ITERATION <= iteration < self.SPEEDYSPLAT_PRUNING.END_ITERATION
-                and iteration % self.SPEEDYSPLAT_PRUNING.INTERVAL == 0
-            ):
-                scores = self.renderer.compute_pruning_scores(dataset.train())
-                self.model.gaussians.importance_pruning(
-                    scores,
-                    pruning_ratio=self.SPEEDYSPLAT_PRUNING.SOFT_PRUNING_RATIO
-                )
+        dens_step_idx = 1 + (iteration - self.DENSIFICATION_START_ITERATION) // self.DENSIFICATION_INTERVAL
+        edge_warmup = self.EDGE_DENSIFICATION.USE and dens_step_idx <= self.EDGE_DENSIFICATION.WARMUP_STEPS
 
-            if iteration < self.DENSIFICATION_END_ITERATION:
-                self.model.gaussians.reset_densification_info()
-                if self.VIDEOVDP_DENSIFICATION.USE:
-                    self.model.gaussians.enable_perceptual_densification()
+        self.model.gaussians.improvedgs_densification(
+            grad_threshold=self.DENSIFICATION_GRAD_THRESHOLD,
+            edge_threshold=self.EDGE_DENSIFICATION.THRESHOLD if self.EDGE_DENSIFICATION.USE else 0.0,
+            min_opacity=0.005,
+            prune_large_gaussians=iteration > self.OPACITY_RESET_INTERVAL,
+            edge_warmup=edge_warmup,
+            use_las=True,
+            las_alpha=0.5,
+            las_gamma=0.85,
+            las_beta=0.6,
+        )
+
+        if iteration < self.DENSIFICATION_END_ITERATION:
+            self.model.gaussians.reset_densification_info()
+            if self.EDGE_DENSIFICATION.USE:
+                self.model.gaussians.enable_edge_densification()
 
         if self.requires_empty_cache:
             torch.cuda.empty_cache()
@@ -303,30 +310,33 @@ class FasterGSTrainer(GuiTrainer):
 
         render_loss = self.loss(image, rgb_gt)
 
-        if self.VIDEOVDP_DENSIFICATION.USE and iteration < self.DENSIFICATION_END_ITERATION and not self.USE_MCMC:
-            heatmap = load_videovdp_heatmap(
-                view,
-                device=image.device,
-                subdirectory=self.VIDEOVDP_DENSIFICATION.HEATMAP_SUBDIRECTORY,
-                suffix=self.VIDEOVDP_DENSIFICATION.HEATMAP_SUFFIX,
+        if (
+            self.EDGE_DENSIFICATION.USE
+            and not self.USE_MCMC
+            and iteration < self.DENSIFICATION_END_ITERATION
+            and self.model.gaussians.edge_densification_info is not None
+        ):
+            edge_scores = compute_edge_scores(
+                rgb_gt.detach(),
+                histogram_bins=self.EDGE_DENSIFICATION.HISTOGRAM_BINS,
+                eps=self.EDGE_DENSIFICATION.EPS,
+                return_intermediates=False,
             )
-            if heatmap is None:
-                if self.VIDEOVDP_DENSIFICATION.LOG_MISSING_ONCE:
-                    heatmap_key = str(getattr(view, 'image_path', getattr(view, 'path', 'unknown_view')))
-                    if heatmap_key not in self._missing_videovdp_heatmaps:
-                        self._missing_videovdp_heatmaps.add(heatmap_key)
-                        Logger.log_warning(
-                            f'no VideoVDP heatmap found for training view {heatmap_key!r} '
-                            f'in subdirectory {self.VIDEOVDP_DENSIFICATION.HEATMAP_SUBDIRECTORY!r} '
-                            f'with suffix {self.VIDEOVDP_DENSIFICATION.HEATMAP_SUFFIX!r}'
-                        )
+
+            # compute_edge_scores returns [B,1,H,W] or [1,1,H,W]
+            if edge_scores.dim() == 4:
+                edge_heatmap = edge_scores[0, 0]
+            elif edge_scores.dim() == 3:
+                edge_heatmap = edge_scores[0]
             else:
-                projected_points, _, in_frustum = view.project_points(self.model.gaussians.means.detach())
-                self.model.gaussians.accumulate_perceptual_densification_info(
-                    projected_points=projected_points,
-                    in_frustum_mask=in_frustum,
-                    heatmap=heatmap,
-                )
+                edge_heatmap = edge_scores
+
+            projected_points, _, in_frustum = view.project_points(self.model.gaussians.means.detach())
+            self.model.gaussians.accumulate_edge_densification_info(
+                projected_points=projected_points,
+                in_frustum_mask=in_frustum,
+                heatmap=edge_heatmap,
+            )
 
         if use_clod:
             eta_actual = lod_meta['eta_actual']
