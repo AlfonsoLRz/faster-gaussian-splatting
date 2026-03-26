@@ -22,7 +22,7 @@ from Optim.Samplers.DatasetSamplers import DatasetSampler
     DENSIFICATION_GRAD_THRESHOLD=0.0002,  # only used when USE_MCMC=False
     DENSIFICATION_PERCENT_DENSE=0.01,  # only used when USE_MCMC=False
     VIDEOVDP_DENSIFICATION=Framework.ConfigParameterList(
-        USE=True,
+        USE=False,
         HEATMAP_SUBDIRECTORY='cvvdp_outputs',
         HEATMAP_SUFFIX='_heatmap_gray.png',
         WEIGHT=1.0,
@@ -62,7 +62,7 @@ from Optim.Samplers.DatasetSamplers import DatasetSampler
         START_ITERATION=5_000,
         VIRTUAL_SCALE_MIN=1.0,
         VIRTUAL_SCALE_MAX=5.0,
-        TAU=1e-2,
+        TAU=0.01,
         LAMBDA_REG=1.0,
         ETA_EXPONENT=1.5,
     ),
@@ -147,6 +147,20 @@ class FasterGSTrainer(GuiTrainer):
         """Scale-dependent weight used in the CLoD training loss."""
         smax = max(self.CLOD.VIRTUAL_SCALE_MAX, 1.0)
         return (1.0 - 0.5 * virtual_scale / smax) ** 2
+
+    @pre_training_callback(priority=60)
+    @torch.no_grad()
+    def log_config(self, _, dataset: 'BaseDataset') -> None:
+        """Log configuration at training startup."""
+        Logger.log_info('=== FasterGSTrainer Configuration ===')
+        Logger.log_info(f'NUM_ITERATIONS: {self.NUM_ITERATIONS}')
+        Logger.log_info(f'DENSIFICATION: {self.DENSIFICATION_START_ITERATION}-{self.DENSIFICATION_END_ITERATION} (interval={self.DENSIFICATION_INTERVAL})')
+        Logger.log_info(f'VIDEOVDP_DENSIFICATION: USE={self.VIDEOVDP_DENSIFICATION.USE}, HEATMAP_SUBDIRECTORY={self.VIDEOVDP_DENSIFICATION.HEATMAP_SUBDIRECTORY}, HEATMAP_SUFFIX={self.VIDEOVDP_DENSIFICATION.HEATMAP_SUFFIX}, WEIGHT={self.VIDEOVDP_DENSIFICATION.WEIGHT}, THRESHOLD={self.VIDEOVDP_DENSIFICATION.THRESHOLD}')
+        Logger.log_info(f'CLOD: USE={self.CLOD.USE}, START={self.CLOD.START_ITERATION}, SCALE_RANGE=[{self.CLOD.VIRTUAL_SCALE_MIN}, {self.CLOD.VIRTUAL_SCALE_MAX}], TAU={self.CLOD.TAU}')
+        Logger.log_info(f'LOSS: LAMBDA_L1={self.LOSS.LAMBDA_L1}, LAMBDA_DSSIM={self.LOSS.LAMBDA_DSSIM}')
+        Logger.log_info(f'OPTIMIZER: LR_means_init={self.OPTIMIZER.LEARNING_RATE_MEANS_INIT}, LR_means_final={self.OPTIMIZER.LEARNING_RATE_MEANS_FINAL}, LR_opacities={self.OPTIMIZER.LEARNING_RATE_OPACITIES}')
+        Logger.log_info(f'USE_MCMC: {self.USE_MCMC}, MAX_PRIMITIVES: {self.MAX_PRIMITIVES if self.USE_MCMC else "N/A"}')
+        Logger.log_info('=' * 40)
 
     @pre_training_callback(priority=50)
     @torch.no_grad()

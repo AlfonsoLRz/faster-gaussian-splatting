@@ -82,6 +82,7 @@ def compute_clod_soft_and_hard_eta(
     FORCE_OPTIMIZED_INFERENCE=False,
     GUI_VIRTUAL_SCALE=0.0,
     CLOD_VIRTUAL_SCALE=1.0,
+    CLOD_ACTIVE_SCALE_EPS=0.001,
     CLOD_TAU=1e-2,
 )
 class FasterGSRenderer(BaseRenderer):
@@ -99,6 +100,30 @@ class FasterGSRenderer(BaseRenderer):
         if self.GUI_VIRTUAL_SCALE > 0.0:
             return self.GUI_VIRTUAL_SCALE
         return self.CLOD_VIRTUAL_SCALE
+
+    def get_rasterizer_virtual_scale_for(self, virtual_scale: float) -> float:
+        """Returns the virtual scale passed to the CUDA rasterizer for a given input scale.
+
+        The rasterizer currently only enables CLoD logic for scales > 1.0.
+        To evaluate "unit-scale CLoD" behavior, you can set
+        `RENDERER.CLOD_ACTIVE_SCALE_EPS` to a small positive value (e.g. 1e-4),
+        which makes a configured scale of exactly 1.0 become 1.0 + eps only for
+        rasterization.
+        """
+        if virtual_scale == 1.0 and self.CLOD_ACTIVE_SCALE_EPS > 0.0:
+            return 1.0 + self.CLOD_ACTIVE_SCALE_EPS
+        return virtual_scale
+
+    def get_rasterizer_virtual_scale(self) -> float:
+        """Returns the virtual scale passed to the CUDA rasterizer.
+
+        The rasterizer currently only enables CLoD logic for scales > 1.0.
+        To evaluate "unit-scale CLoD" behavior, you can set
+        `RENDERER.CLOD_ACTIVE_SCALE_EPS` to a small positive value (e.g. 1e-4),
+        which makes a configured scale of exactly 1.0 become 1.0 + eps only for
+        rasterization.
+        """
+        return self.get_rasterizer_virtual_scale_for(self.get_virtual_scale())
 
     def render_image(self, view: View, to_chw: bool = False, benchmark: bool = False) -> dict[str, torch.Tensor]:
         if benchmark or self.FORCE_OPTIMIZED_INFERENCE:
@@ -120,7 +145,6 @@ class FasterGSRenderer(BaseRenderer):
         device = gaussians.means.device
 
         effective_use_clod = use_clod and (not update_densification_info)
-        actual_virtual_scale = virtual_scale if effective_use_clod else 1.0
 
         image = diff_rasterize(
             means=gaussians.means,
@@ -132,7 +156,7 @@ class FasterGSRenderer(BaseRenderer):
             sh_coefficients_rest=gaussians.sh_coefficients_rest,
             densification_info=gaussians.densification_info if update_densification_info else torch.empty(0, device=device),
             rasterizer_settings=extract_settings(view, gaussians.active_sh_bases, bg_color, self.PROPER_ANTIALIASING),
-            virtual_scale=actual_virtual_scale,
+            virtual_scale=virtual_scale,
             tau=tau,
         )
 
@@ -174,7 +198,7 @@ class FasterGSRenderer(BaseRenderer):
                 self.PROPER_ANTIALIASING,
             ),
             to_chw=True,
-            virtual_scale=self.get_virtual_scale(),
+            virtual_scale=self.get_rasterizer_virtual_scale(),
             tau=self.CLOD_TAU,
         )
 
@@ -198,7 +222,7 @@ class FasterGSRenderer(BaseRenderer):
                 self.PROPER_ANTIALIASING,
             ),
             to_chw=True,
-            virtual_scale=self.get_virtual_scale(),
+            virtual_scale=self.get_rasterizer_virtual_scale(),
             tau=self.CLOD_TAU,
         )
 

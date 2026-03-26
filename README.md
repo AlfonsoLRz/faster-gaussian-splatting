@@ -126,6 +126,14 @@ FasterGS exposes two renderer configuration values for the CLoD virtual distance
 
 - `RENDERER.CLOD_VIRTUAL_SCALE`: the default runtime virtual scale used during inference.
 - `RENDERER.GUI_VIRTUAL_SCALE`: an optional GUI override. If this value is set to something larger than `0.0`, the renderer uses it instead of `CLOD_VIRTUAL_SCALE`.
+- `RENDERER.CLOD_ACTIVE_SCALE_EPS`: optional epsilon used only when `CLOD_VIRTUAL_SCALE` (or GUI override) is exactly `1.0`. This is useful for evaluation because the CUDA CLoD gate is currently enabled for `virtual_scale > 1.0`. Set a tiny value (e.g. `1e-4`) to approximate "test at virtual LOD = 1.0 with CLoD active".
+- `RENDERER.CLOD_TAU`: inference-time CLoD threshold parameter.
+
+For CLoD evaluation sweeps, a practical setup is:
+
+- fix virtual scale at `1.0` with a small `CLOD_ACTIVE_SCALE_EPS`,
+- evaluate several `CLOD_TAU` values (for example in `+0.1` steps, as long as the range remains meaningful for your scene/opacity scale),
+- compare PSNR and visual output for each pair.
 
 This repository only contains the FasterGS method integration and renderer hook. The actual GUI widgets live in the main NeRFICG repository, so you will not see a new slider or input field here unless the NeRFICG GUI code is updated to write `RENDERER.GUI_VIRTUAL_SCALE`.
 
